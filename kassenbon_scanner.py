@@ -4,6 +4,7 @@ Created on Sun Aug 31 19:14:15 2025
 
 @author: ONeum
 """
+# Test-Commit – nur zum Überprüfen des GitHub Push
 
 # kassenbon_scanner.py
 # Foto -> OCR (mehrere Varianten) -> Parsing -> Merge -> Excel
