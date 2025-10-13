@@ -168,6 +168,20 @@ def guess_category(name: str|None) -> str|None:
 # =================== Hilfsfunktionen ===================
 
 import re
+import re
+_STORE_NOISE = re.compile(r"^[A-ZÄÖÜ\s]{1,6}$")
+_STORE_BROKEN = re.compile(r"[A-ZÄÖÜ]{2,}\s+[A-ZÄÖÜ]{1,2}\s+[A-ZÄÖÜ]{2,}")
+def _looks_like_noise(ln: str) -> bool:
+    if not ln: return True
+    s = ln.strip()
+    if not s: return True
+    letters = sum(c.isalpha() for c in s)
+    if letters < 4: return True
+    if _STORE_NOISE.match(s): return True
+    if _STORE_BROKEN.search(s): return True
+    low = sum(c.islower() for c in s)
+    if len(s) > 24 and low == 0: return True
+    return False
 
 def coerce_type_by_store(store: str, fallback: str = "grocery") -> str:
     """Erzwingt anhand des Laden-Namens einen Belegtyp (z.B. grocery)."""
@@ -250,6 +264,136 @@ def _roi_lines(text: str, key_regex: str, window: int = 2) -> str:
             out.extend(lines[start:end])
     return "\n".join(out) if out else text
 
+import re
+
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _is_amount_line(ln: str) -> bool:
+    return bool(re.search(r"\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\s*(?:€|EUR)?", ln))
+
+def _looks_trash(ln: str) -> bool:
+    # sehr kurze Splitter oder fast nur Sonderzeichen
+    if len(ln.strip()) < 3:
+        return True
+    letters = sum(ch.isalpha() for ch in ln)
+    return letters < 3
+
+def _extract_store_from_footer(text: str) -> str | None:
+    """
+    Sucht im Bonfuß nach 'Einkauf getätigt in' und nutzt die nächsten 1–2 Zeilen,
+    um einen Store-Name + Ort zu bauen. Speziell gut für Lidl-App-Bons.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    for i, ln in enumerate(lines):
+        if re.search(r"(?i)Einkauf\s+getäti?gt\s+in", ln):
+            # Nimm bis zu zwei sinnvolle Folgezeilen
+            tail = []
+            for j in range(i+1, min(i+4, len(lines))):
+                s = _norm_ws(lines[j])
+                if not s or _is_amount_line(s) or _looks_trash(s):
+                    continue
+                tail.append(s)
+                if len(tail) >= 2:
+                    break
+
+            # Lidl-Heuristik: wenn im gesamten Text LIDL/Lidl Pay vorkommt → 'Lidl <Ort>'
+            txt_up = (text or "").upper()
+            if re.search(r"\bLIDL\b", txt_up) or re.search(r"\bLIDL\s*PAY\b", txt_up):
+                city = None
+                # suche eine Zeile mit PLZ + Ort oder etwas, das wie eine Ortszeile aussieht
+                for z in tail:
+                    m = re.search(r"\b(\d{5})\s+([A-ZÄÖÜ][\wÄÖÜäöüß\- ]+)", z)
+                    if m:
+                        city = m.group(2).strip()
+                        break
+                if not city and tail:
+                    # fallback: erste „vernünftige“ tail-Zeile als Ort
+                    city = tail[-1].split()[-1].strip()
+                if city:
+                    return f"Lidl {city}"
+                else:
+                    return "Lidl"
+
+            # Allgemeiner Fallback: nimm erste sinnvolle Zeile als Laden
+            if tail:
+                # Wenn die erste Tail-Zeile wie eine Adresse wirkt, versuche zweite als Store
+                addr_pat = re.compile(r"(?i)(straße|str\.|weg|allee|platz|gasse|\b\d{1,4}\b)")
+                if len(tail) == 1:
+                    return tail[0]
+                if not addr_pat.search(tail[0]) and addr_pat.search(tail[1]):
+                    return tail[0]
+                # sonst nimm Kombination, aber ohne zu lang zu werden
+                combo = _norm_ws(" ".join(tail[:2]))
+                if len(combo) > 40:
+                    return tail[0]
+                return combo
+
+    return None
+
+def _guess_store_name_strict(text: str) -> str | None:
+    """
+    Robuste Erkennung aus dem Kopf: bekannte Ketten oder „volle“ Kopfzeile.
+    """
+    CHAINS = [
+        r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
+        r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b", r"\bAPOTHEKE\b",
+        r"\bARAL\b", r"\bSHELL\b", r"\bJET\b", r"\bESSO\b", r"\bTOTAL\b",
+        r"\bNIELSEN\b", r"\bSCAN-?SHOP\b",
+        r"\bMELANCHTHONSTR(?:AßE|ASSE)?\b",  # Standort-Hinweis hilft dem Kontext
+    ]
+
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    head  = lines[:18]
+
+    # 1) direkte Kettennamen
+    head_join = "\n".join(head)
+    for pat in CHAINS:
+        m = re.search(pat, head_join, re.I)
+        if m:
+            return m.group(0).upper().strip()
+
+    # 2) Zeilen mit viel Uppercase, aber ohne Beträge
+    candidates = []
+    for ln in head:
+        if _is_amount_line(ln) or _looks_trash(ln):
+            continue
+        letters = [c for c in ln if c.isalpha()]
+        if not letters:
+            continue
+        ups = sum(1 for c in letters if c.isupper())
+        score = ups / max(1, len(letters))
+        candidates.append((score, len(ln), ln))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        cand = _norm_ws(candidates[0][2])
+        # Müll ausschließen (einzelne „Wörter“ mit Lücken)
+        if re.search(r"^[A-ZÄÖÜ]{2,}(?:\s+[A-ZÄÖÜ]{2,})+$", cand) and len(cand) < 6:
+            return None
+        return cand
+
+    return None
+
+def _store_is_bad(s: str | None) -> bool:
+    """
+    Erkennung „schlechter“ Store-Namen (z.B. 'SHES Ste  FN', 'IN DER', zu kurz, fast leer).
+    """
+    if not s:
+        return True
+    t = _norm_ws(s)
+    if len(t) < 4:
+        return True
+    if t.upper() in {"IN", "DER", "IN DER"}:
+        return True
+    # enthält viele Lücken mitten in Wörtern → OCR-Müll
+    if re.search(r"[A-Za-zÄÖÜß]\s{2,}[A-Za-zÄÖÜß]", t):
+        return True
+    # nur Großbuchstabenblöcke mit vielen Einzelfragmenten
+    parts = [p for p in t.split() if p]
+    if len(parts) >= 3 and sum(len(p) <= 3 for p in parts) >= 2:
+        return True
+    return False
 
 
 # =================== Vorverarbeitung ===================
@@ -422,29 +566,29 @@ def _is_bad_store_name(name: str) -> bool:
         return True
     return False
 
-
 def _pick_total_candidate(text: str) -> float | None:
     money = r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
-    pats = [
-        rf"(?im)\b(zu\s*zahlen|endbetrag|gesamt|summe|betrag)\b[^\d]{{0,40}}{money}\s*(?:€|eur)?",
-        rf"(?im){money}\s*(?:€|eur)\s*$",
-    ]
-    cands = []
-    for pat in pats:
-        for m in re.finditer(pat, text):
-            try:
-                # letztes Capturing-Group ist die Zahl
-                val = float(m.group(m.lastindex).replace(".", "").replace(",", "."))
-                cands.append((m.start(), val, m.group(0)))
-            except:
-                pass
-    if not cands:
-        return None
-    cands.sort(key=lambda t: t[0])  # nach Position im Text
-    vals = [v for _, v, _ in cands]
-    # Plausibilitätsfilter: Lebensmittel-Bons meist < 1000; große glatte Ausreißer raus
-    plausible = [v for v in vals if (0 < v < 1000) or (v < 10000 and abs(v - round(v)) < 1e-9)]
-    return (plausible[-1] if plausible else vals[-1])
+    kw = r"(zu\s*zahlen|endbetrag|gesamt|summe|betrag|total)"
+    bad_line = re.compile(r"(?:TSE|UST|ID|TRANS|TERMINAL|000Z|T\d|Z$)", re.I)
+    best = None
+    for ln in text.splitlines():
+        s = (ln or "").strip()
+        if not s or bad_line.search(s): continue
+        m = re.search(rf"(?i)\b{kw}\b[^\d]{{0,40}}{money}\s*(?:€|EUR)?", s)
+        if not m:
+            m = re.search(rf"{money}\s*(?:€|EUR)?\s*$", s)
+        if m:
+            val = _norm_money(m.group(m.lastindex))
+            if 0 < val <= 2000:
+                best = val
+    return best
+
+def _is_plausible_amount(v: float) -> bool:
+    return (v is not None) and (0 < v <= 2000)
+# … nach dem Zusammenführen:
+if "Betrag (€)" in data and not _is_plausible_amount(data["Betrag (€)"]):
+    data.pop("Betrag (€)", None)
+
 
 # =================== OCR Varianten ===================
 
@@ -907,6 +1051,16 @@ def _detect_payment(text: str) -> str | None:
     # Hinweise aus Terminal-Block:
     if re.search(r"\bkontaktlos\b|\bnfc\b|\bchip\b|emv", t) and ("bar" not in t):
         return "Karte"
+        # Lidl Pay – auch falsche OCR-Varianten abfangen
+    if re.search(r"\bL[I1]DL\s*PAY\b", t) or re.search(r"\bCN\s*PAY\b", t) or "LIDL PAY" in t:
+        return "Lidl Pay"
+    if re.search(r"\bGIRO?CARD\b", t) or "KARTENZAHLUNG" in t or "KARTE" in t:
+        return "Karte"
+    if "BAR" in t or "CASH" in t:
+        return "Bar"
+    if "LASTSCHRIFT" in t or "SEPA" in t or "MANDAT" in t:
+        return "Lastschrift"
+
     return None
 
 def majority_payment(texts: list[str]) -> str | None:
@@ -1108,42 +1262,29 @@ STORE_KEYWORDS = [
 _store_pat = re.compile(r"(?i)(" + "|".join(STORE_KEYWORDS) + r")")
 
 def _guess_store_name_head(text: str, top_n: int = 12) -> str | None:
-    """
-    Nimmt die ersten 'top_n' nicht-leeren Zeilen und sucht eine ‚store-artige‘ Zeile.
-    Strategie:
-      1) Falls eine Zeile beide enthält (z.B. 'Nielsen SCAN-SHOP'): nimm genau diese Zeile.
-      2) Sonst: nimm die erste Zeile, die einen Store-Keyword enthält (NORMA, LIDL, SCAN-SHOP …).
-      3) Fallback: nimm die längste sehr „großgeschriebene“ Zeile (viel Uppercase).
-    """
-    if not text:
-        return None
+    if not text: return None
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     head = lines[:top_n]
-
-    # 1) Zeile, die mehrere Keywords kombiniert (z.B. "Nielsen SCAN-SHOP")
+    CHAINS = [r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
+              r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b",
+              r"\bAPOTHEKE\b", r"\bNIELSEN\b", r"\bSCAN-?SHOP\b", r"\bKAUFLAND\b"]
+    store_pat = re.compile("|".join(CHAINS), re.I)
+    money_pat = re.compile(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\s*(?:€|EUR)?\b", re.I)
     for ln in head:
-        if len(re.findall(_store_pat, ln)) >= 1 and ("SCAN" in ln.upper() or "SHOP" in ln.upper() or "NIELSEN" in ln.upper()):
-            return ln
-
-    # 2) erste Zeile mit Keyword
+        if _looks_like_noise(ln): continue
+        if store_pat.search(ln) and any(k in ln.upper() for k in ("SCAN","SHOP","NIELSEN","LIDL")):
+            return ln.strip()
     for ln in head:
-        if _store_pat.search(ln):
-            return ln
-
-    # 3) Fallback: „schreiende“ Zeile
-    def _upper_score(s: str) -> float:
-        letters = [c for c in s if c.isalpha()]
-        if not letters:
-            return 0.0
-        ups = sum(1 for c in letters if c.isupper())
-        return ups / max(1, len(letters))
-    if head:
-        head_sorted = sorted(head, key=lambda s: (_upper_score(s), len(s)), reverse=True)
-        cand = head_sorted[0]
-        # Softer Filter: nur zurückgeben, wenn sie nicht wie eine Artikelzeile aussieht
-        if not re.search(r"\b(\d+[.,]\d{2})\s*(EUR|€)\b", cand):
-            return cand
-
+        if _looks_like_noise(ln): continue
+        if store_pat.search(ln): return ln.strip()
+    head_filtered = [ln for ln in head if not _looks_like_noise(ln)]
+    if head_filtered:
+        def _upper_score(s):
+            letters=[c for c in s if c.isalpha()]
+            if not letters: return 0.0
+            return sum(1 for c in letters if c.isupper())/len(letters)
+        cand = sorted(head_filtered, key=lambda s: (_upper_score(s), len(s)), reverse=True)[0]
+        if not money_pat.search(cand): return cand.strip()
     return None
 
 def _is_bad_store_name(name: str) -> bool:
@@ -1257,30 +1398,6 @@ def _dedupe_strs(items: list[str]) -> list[str]:
 
 def _money_regex() -> str:
     return r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
-
-def _pick_total_candidate(text: str) -> float | None:
-    money = r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
-    # Kandidaten sammeln – mit starker Keywordnähe
-    pats = [
-        rf"(?im)\b(zu\s*zahlen|endbetrag|gesamt|summe|betrag)\b[^\d]{{0,40}}{money}\s*(?:€|eur)?",
-        rf"(?im){money}\s*(?:€|eur)\s*$",  # Betrag am Zeilenende mit EUR
-    ]
-    cands = []
-    for pat in pats:
-        for m in re.finditer(pat, text):
-            try:
-                val = _norm_money(m.group(len(m.groups())))  # letztes group ist die Zahl
-                cands.append((m.start(), val, m.group(0)))
-            except:
-                pass
-    if not cands:
-        return None
-    # Letzte/unterste priorisieren
-    cands.sort(key=lambda t: t[0])  # nach Position
-    vals = [v for _, v, _ in cands]
-    # Plausibilitätsfilter: keine absurden Ausreißer
-    plausible = [v for v in vals if (0 < v < 1000) or (v < 10000 and v % 1 == 0)]
-    return (plausible[-1] if plausible else vals[-1])
 
 def _sanitize_store_name(store: str | None, head_text: str) -> str | None:
     import re
@@ -1681,86 +1798,80 @@ PAYMENT_KEYWORDS = {
 # =================== Parsing ===================
 
 def _guess_store_name(text: str) -> str | None:
-    """Ermittelt den Laden aus Kopf/Fuß. Lidl bekommt eine eigene Footer-Heuristik."""
-    import re
-
-    if not text:
-        return None
-
-    # ---------- 0) Lidl-Heuristik (aus Footer "Einkauf getätigt in") ----------
-    up = text.upper()
-    if "LIDL" in up:
-        # Beispiele im Footer:
-        # "Einkauf getätigt in\nBretten - Melanchthonstraße\n..."
-        # "Einkauf getätigt In\nBretten - ...\n..."
-        m = re.search(r"(?is)Einkauf\s+get[aä]tigt\s+in\s*\n([^\n]+)", text)
-        if m:
-            line = m.group(1).strip()
-            # oft "Stadt - Straße" -> nimm Stadt links vom Bindestrich
-            city = line.split("-")[0].strip()
-            # fallback: wenn das komisch aussieht, versuch die nächste Zeile
-            if len(city) < 2 or len(re.findall(r"[A-Za-zÄÖÜäöü]", city)) < 2:
-                m2 = re.search(r"(?is)Einkauf\s+get[aä]tigt\s+in\s*\n[^\n]*\n([^\n]+)", text)
-                if m2:
-                    city = m2.group(1).strip().split("-")[0].strip()
-
-            # final sanity:
-            if 2 <= len(city) <= 40 and re.search(r"[A-Za-zÄÖÜäöü]", city):
-                return f"Lidl {city}"
-        # Wenn Footer nicht greift: zumindest "Lidl"
-        return "Lidl"
-
-    # ---------- 1) Kopfbereich untersuchen (wie bisher) ----------
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:18]
     head  = "\n".join(lines)
-
-    CHAINS = [
-        r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
-        r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b", r"\bAPOTHEKE\b",
-        r"\bARAL\b", r"\bSHELL\b", r"\bJET\b", r"\bESSO\b", r"\bTOTAL\b",
-        r"\bHAGEBAU\b", r"\bKAUF(?:LAND)?\b", r"\bNIELSEN\b", r"\bSCAN-?SHOP\b"
-    ]
+    CHAINS = [r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
+              r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b",
+              r"\bAPOTHEKE\b", r"\bARAL\b", r"\bSHELL\b", r"\bJET\b", r"\bESSO\b", r"\bTOTAL\b",
+              r"\bNIELSEN\b", r"\bSCAN-?SHOP\b", r"\bKAUFLAND\b"]
+    chain_pat = re.compile("|".join(CHAINS), re.I)
     MONEY  = re.compile(r"\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\s*(?:€|EUR)?", re.I)
     FOOTKW = re.compile(r"(?i)\b(einkaufswert|summe|gesamt|betrag|zu\s*zahlen|gegeben|zurück|wechselgeld|mwst|ust|netto|brutto|girocard|ust-?id|ta-?nr|bnr|terminal|karte)\b")
     GENERIC= re.compile(r"(?i)^(apotheke|bäckerei|metzgerei|imbiss|shop)$")
     NAME   = re.compile(r"(?i)^[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9\s\-\&\.]{2,40}$")
-    STREET = re.compile(r"(?i)\b(str(?:aße|asse)\.?|weg|platz|allee|gasse|straße)\b")
+    STREET = re.compile(r"(?i)\b(str(?:aße|asse)\.?|weg|platz|allee|gasse)\b")
     ZIP    = re.compile(r"\b\d{4,5}\b")
-
     def _is_head_name(ln: str) -> bool:
         if MONEY.search(ln): return False
         if FOOTKW.search(ln): return False
+        if _looks_like_noise(ln): return False
         letters = sum(ch.isalpha() for ch in ln)
         return letters >= 4
-
-    # 1a) Kettenname direkt
-    for pat in CHAINS:
-        m = re.search(pat, head, re.I)
-        if m:
-            return m.group(0).upper().strip()
-
-    # 1b) Name gefolgt von Adresse
+    m = chain_pat.search(head)
+    if m: return m.group(0).upper().strip()
     for i, ln in enumerate(lines):
-        if not _is_head_name(ln): 
-            continue
-        if GENERIC.match(ln):
-            continue
+        if not _is_head_name(ln): continue
+        if GENERIC.match(ln): continue
         if NAME.match(ln):
             near = lines[i+1:i+4]
             if any(_is_head_name(x) and (STREET.search(x) or ZIP.search(x)) for x in near):
                 return ln.strip()
-
-    # 1c) Fallback: erste „gute“ Kopfzeile
     for ln in lines:
         if _is_head_name(ln) and not GENERIC.match(ln):
-            cand = ln.strip()
-            # kleiner Sanitizer gegen Müll wie "SHES Ste FN"
-            if len(re.findall(r"[AEIOUÄÖÜaeiouäöü]", cand)) == 0 and len(cand.split()) <= 3:
-                continue
-            return cand
-
-    # 2) letzter Fallback: None
+            return ln.strip()
     return None
+
+def _is_plausible_total(val: float) -> bool:
+    """
+    Sehr simple Schranke gegen Ausreißer:
+    - Totale < 0.01 oder > 2000 verwerfen (kannst du anpassen)
+    """
+    try:
+        if val is None:
+            return False
+        if not isinstance(val, (int, float)):
+            return False
+        if val < 0.01 or val > 2000:   # Deckel anpassen, falls du große Rechnungen hast
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _sanitize_total(maybe_val, context_text: str = ""):
+    """
+    Repariert typische OCR-Patzer:
+      - Zahlen ohne Dezimaltrenner, die aber wie 5-stellige Timestamps aussehen (z.B. '356.000Z' → 35600) → verwerfen
+      - Beträge ohne Komma und >= 1000 → verwerfen
+      - Nur Werte mit ,xx (oder .xx) bevorzugen
+    """
+    def _looks_like_garbage_nearby(s: str) -> bool:
+        # Z / T / ms aus ISO-Zeitstempeln in der Nähe? => Mist
+        return bool(re.search(r"[ZT]\s*$", s)) or "000Z" in s.upper()
+
+    try:
+        if maybe_val in (None, "", 0):
+            return None
+        v = float(maybe_val)
+        # Ausreißer raus
+        if not _is_plausible_total(v):
+            return None
+        # Zusatz-Heuristik: Wenn im Kontext häufig '000Z' / ISO-Stempel auftauchen und v sehr groß ist → No
+        if v >= 1000 and re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", context_text):
+            return None
+        return round(v, 2)
+    except Exception:
+        return None
 
 
 def extract_data_from_text(text: str) -> dict:
@@ -1904,9 +2015,16 @@ def extract_data_from_text(text: str) -> dict:
     # --- BETRAG ---
     # starker Fallback (holt z. B. „zu zahlen 25,01 EUR“)
     if "Betrag (€)" not in data or not data["Betrag (€)"]:
-        tot = _pick_total_candidate(text)
-        if tot is not None:
-            data["Betrag (€)"] = tot
+        def _is_plausible_amount(v: float) -> bool:
+            # keine gigantischen Zahlen (OCR „356.000Z“ → 35600.0)
+            if v <= 0 or v > 2000:  # Einkaufs-Bons >2000 € sind extrem selten
+                return False
+            return True
+
+    # ... beim Setzen von "Betrag (€)":
+    tot = _pick_total_candidate(text)
+    if tot is not None and _is_plausible_amount(tot):
+        data["Betrag (€)"] = tot
     # --- Gegeben / Wechselgeld (optional) ---
     m = re.search(rf"(?i)\b(gegeben|bar(?:zahlung)?|gezahlt)\b[^\d]{{0,20}}{money}\s*(?:€|eur)?", text)
     if m:
@@ -3552,7 +3670,17 @@ def scan_kassenbon(
             parsed.append({"Rohtext": tx})
 
     rtype = detect_receipt_type(combo_text) if 'detect_receipt_type' in globals() else "generic"
-    best  = merge_variant_dicts(parsed, receipt_type=rtype)
+    best = merge_variant_dicts(parsed, receipt_type=rtype)
+
+    # Betrag sanity
+    if best.get("Betrag (€)"):
+        best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
+
+    # Store-Fallback aus Foot/Domain (z.B. LIDL)
+    if not best.get("Laden") or len(best["Laden"]) < 3 or " " not in best["Laden"]:
+        s_fallback = _guess_store_name(combo_text)
+        if s_fallback:
+            best["Laden"] = s_fallback
 
     # --- Store-basierter Typ-Override ---
     forced = coerce_type_by_store(best.get("Laden") or "")
@@ -3592,17 +3720,27 @@ def scan_kassenbon(
             except Exception:
                 pass
     # Laden aus Kopf priorisieren (z.B. 'Nielsen SCAN-SHOP')
-    # --- Laden-Fallback/Override ---
-    store_now = (best.get("Laden") or "").strip()
-    if (not store_now) or _is_bad_store_name(store_now) or store_now.upper() in {"IN", "DER", "IN DER", "APOTHEKE"}:
-        # zuerst: intelligenter Guess über gesamten Text (enthält den Lidl-Footer)
-        store_guess = _guess_store_name(combo_text)
-        if not store_guess:
-            # Fallback: nur Kopfzeilen-Heuristik
-            head_guess = _guess_store_name_head(combo_text)
-            store_guess = head_guess
-        if store_guess:
-            best["Laden"] = store_guess
+    # --- Laden robuster nachschärfen (Header & Footer kombiniert) ---
+    store_now = best.get("Laden")
+    if _store_is_bad(store_now):
+        # erst strikte Kopf-Erkennung
+        cand_head = _guess_store_name_strict(combo_text)
+        if cand_head and not _store_is_bad(cand_head):
+            best["Laden"] = cand_head
+        else:
+            # dann Footer-Heuristik: „Einkauf getätigt in …“
+            cand_foot = _extract_store_from_footer(combo_text)
+            if cand_foot and not _store_is_bad(cand_foot):
+                best["Laden"] = cand_foot
+
+    # Lidl-Spezial: wenn Lidl/Lidl Pay im Text und kein vernünftiger Name → Lidl <Ort> aus Footer
+    if _store_is_bad(best.get("Laden")):
+        if re.search(r"(?i)\bLIDL\b", combo_text) or re.search(r"(?i)LIDL\s*PAY", combo_text):
+            cand_foot = _extract_store_from_footer(combo_text)
+            if cand_foot:
+                best["Laden"] = cand_foot
+            else:
+                best["Laden"] = "Lidl"
 
     # b) wenn immer noch nix: nimm größte Summe im unteren Textbereich
     if not best.get("Betrag (€)"):
