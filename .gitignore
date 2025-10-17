@@ -1,0 +1,51 @@
+# ==============================
+# Kassenbon-Scanner: .gitignore
+# ==============================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.dll
+*.log
+
+# --- Virtuelle Umgebungen ---
+.venv/
+env/
+venv/
+ENV/
+*.env
+
+# --- PyCharm / JetBrains ---
+.idea/
+*.iml
+
+# --- Temporäre / Cache-Dateien ---
+*.tmp
+*.bak
+*.swp
+*.DS_Store
+Thumbs.db
+
+# --- Excel / Ergebnisdateien ---
+kassenbons.xlsx
+kassenbons_neu.xlsx
+*.ods
+*.csv
+
+# --- OCR / Testdaten ---
+/Kassenbons/
+*.jpeg
+*.jpg
+*.png
+*.pdf
+
+# --- Sonstiges ---
+/output/
+test_*/
+backup_*/
+# Lokaler Clone-Ordner ausschließen
+Klon/
