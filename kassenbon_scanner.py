@@ -1062,7 +1062,7 @@ def detect_payment_method(text: str) -> str | None:
 
 def _detect_payment(text: str) -> str | None:
     t = text.lower()
-    # Klartexte
+    # Klartexte ...
     if re.search(r"\bbar(?:zahlung)?\b|cash\b", t): return "Bar"
     if re.search(r"\b(girocard|ec-?karte|maestro|lastschrift)\b", t): return "Girocard"
     if re.search(r"\bkreditkarte\b|\bvisa\b|\bmastercard\b|\bamex\b", t): return "Kreditkarte"
