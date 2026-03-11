@@ -20,6 +20,11 @@ DEBUG_PAYMENTS  = True   # zeigt "💳 Zahlungsart ..." Debug-Ausgaben
 DEBUG_PRINTS = True  # global
 DEBUG_HEAD = True  # bei Bedarf auf False setzen
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SCAN_DIR = os.path.join(BASE_DIR, "Kassenbons")
+EXCEL_PATH = os.path.join(BASE_DIR, "kassenbons.xlsx")
+
 def _print_clean_head(label: str, text: str, n: int = 20):
     if not DEBUG_HEAD:
         return
@@ -587,11 +592,6 @@ def _pick_total_candidate(text: str) -> float | None:
 
 def _is_plausible_amount(v: float) -> bool:
     return (v is not None) and (0 < v <= 2000)
-# … nach dem Zusammenführen:
-if "Betrag (€)" in data and not _is_plausible_amount(data["Betrag (€)"]):
-    data.pop("Betrag (€)", None)
-
-
 # =================== OCR Varianten ===================
 
 # ======= Kachelung für sehr lange Bilder (AUTO) =======
@@ -4529,7 +4529,7 @@ if __name__ == "__main__":
         print(f"❗ Testbild nicht gefunden: {TEST_IMAGE}")
 
 batch_scan_folder(
-    r"C:\Users\ONeum\Documents\ChatGPT\Kassenbons",
+    r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons",
     excel_path=EXCEL_PATH,
     review_when="prüfen",   # nur unsichere Fälle manuell
     strict_total=True,
@@ -4540,7 +4540,7 @@ batch_scan_folder(
 # ===================== Entry-Point =====================
 
 if __name__ == "__main__":
-    TARGET_PATH     = r"C:\Users\ONeum\Documents\ChatGPT\Kassenbons\Apotheke.png"  # Datei ODER Ordner
+    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons\Apotheke.png"  # Datei ODER Ordner
     EXCEL_PATH      = "kassenbons.xlsx"
     REVIEW_WHEN     = "prüfen"
     STRICT_TOTAL    = True
