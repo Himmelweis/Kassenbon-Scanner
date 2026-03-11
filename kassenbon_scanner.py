@@ -15,6 +15,8 @@ from datetime import datetime
 from PIL import Image
 
 # ========= Debug Switches (standard: aus) =========
+
+FAST = True
 DEBUG_OCR_TYPES = False   # zeigt "DEBUG ocr_text_multi types: [...]"
 DEBUG_PAYMENTS  = True   # zeigt "💳 Zahlungsart ..." Debug-Ausgaben
 DEBUG_PRINTS = True  # global
@@ -592,6 +594,25 @@ def _pick_total_candidate(text: str) -> float | None:
 
 def _is_plausible_amount(v: float) -> bool:
     return (v is not None) and (0 < v <= 2000)
+
+def _is_bad_store_name(name: str) -> bool:
+    s = (name or "").strip()
+    if not s:
+        return True
+    if len(s) < 4:
+        return True
+    # viele einzelne/kaputte OCR-Wörter
+    if sum(1 for w in s.split() if len(w) <= 2) >= 2:
+        return True
+    # sehr viele Leerstellen mitten im Wort
+    if "  " in s:
+        return True
+    # kaum Vokale -> oft OCR-Müll
+    letters = [c for c in s if c.isalpha()]
+    vowels  = [c for c in s.lower() if c in "aeiouäöü"]
+    if len(letters) >= 6 and len(vowels) <= 1:
+        return True
+    return False
 # =================== OCR Varianten ===================
 
 # ======= Kachelung für sehr lange Bilder (AUTO) =======
@@ -1469,14 +1490,15 @@ def ocr_text_multi(image_path: str) -> list[str]:
                 if tx:
                     txts.append(safe_post_ocr_cleanup(tx))
             # Adaptive Kachelung
-            for tx in ocr_text_tiled(image_path, use_alt=True):
-                if not tx:
-                    continue
-                if isinstance(tx, bytes):
-                    tx = tx.decode("utf-8", "ignore")
-                tx = tx.strip()
-                if tx:
-                    txts.append(safe_post_ocr_cleanup(tx))
+            if not fast:
+                for tx in ocr_text_tiled(image_path, use_alt=True):
+                    if not tx:
+                        continue
+                    if isinstance(tx, bytes):
+                        tx = tx.decode("utf-8", "ignore")
+                    tx = tx.strip()
+                    if tx:
+                        txts.append(safe_post_ocr_cleanup(tx))
     except Exception as e:
         print(f"⚠️ Kachel-OCR übersprungen: {e}")
 
@@ -1576,13 +1598,14 @@ def ocr_text_multi(image_path: str) -> list[str]:
     except Exception as e:
         print(f"⚠️ ROI unten übersprungen: {e}")
 
-    # 5b) Brute-Force Totals-Jäger
-    try:
-        for tx in ocr_bruteforce_totals(image_path):
-            if tx.strip():
-                txts.append(safe_post_ocr_cleanup(tx))
-    except Exception as e:
-        print(f"⚠️ Totals-Bruteforce übersprungen: {e}")
+    # 5b) Brute-Force Totals-Jäger nur im Langsam-/Debug-Modus
+    if not fast:
+        try:
+            for tx in ocr_bruteforce_totals(image_path):
+                if tx.strip():
+                    txts.append(safe_post_ocr_cleanup(tx))
+        except Exception as e:
+            print(f"⚠️ Totals-Bruteforce übersprungen: {e}")
 
     # 6) Flatten + Deduplizieren + Cleanup
     debug_types = bool(globals().get("DEBUG_OCR_TYPES", False))
@@ -1802,10 +1825,13 @@ PAYMENT_KEYWORDS = {
 def _guess_store_name(text: str) -> str | None:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:18]
     head  = "\n".join(lines)
-    CHAINS = [r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
-              r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b",
-              r"\bAPOTHEKE\b", r"\bARAL\b", r"\bSHELL\b", r"\bJET\b", r"\bESSO\b", r"\bTOTAL\b",
-              r"\bNIELSEN\b", r"\bSCAN-?SHOP\b", r"\bKAUFLAND\b"]
+    CHAINS = [
+        r"\bLIDL\b", r"\bALDI\b", r"\bEDEKA\b", r"\bREWE\b", r"\bNORMA\b",
+        r"\bNETTO\b", r"\bPENNY\b", r"\bDM\b", r"\bROSSMANN\b",
+        r"\bAPOTHEKE\b", r"\bARAL\b", r"\bSHELL\b", r"\bJET\b",
+        r"\bESSO\b", r"\bTOTAL\b", r"\bHAGEBAU\b", r"\bOBI\b",
+        r"\bBAUHAUS\b", r"\bHORNBACH\b", r"\bNIELSEN\b", r"\bSCAN-?SHOP\b"
+    ]
     chain_pat = re.compile("|".join(CHAINS), re.I)
     MONEY  = re.compile(r"\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\s*(?:€|EUR)?", re.I)
     FOOTKW = re.compile(r"(?i)\b(einkaufswert|summe|gesamt|betrag|zu\s*zahlen|gegeben|zurück|wechselgeld|mwst|ust|netto|brutto|girocard|ust-?id|ta-?nr|bnr|terminal|karte)\b")
@@ -3938,6 +3964,27 @@ def scan_kassenbon(
     print("Datum:", best.get("Datum"), "Uhrzeit:", best.get("Uhrzeit"))
     print("Betrag:", best.get("Betrag (€)"))
 
+    def _status_from(d: dict) -> str:
+        betrag = d.get("Betrag (€)")
+        laden = d.get("Laden")
+        zahl = d.get("Zahlung")
+        rtype = d.get("Belegtyp")
+
+        if strict_total and (betrag in (None, "", 0)):
+            return "Prüfen: Betrag fehlt"
+
+        if _is_bad_store_name(laden):
+            return "Prüfen: Laden unsicher"
+
+        if rtype in (None, "", "generic"):
+            return "Prüfen: Typ unsicher"
+
+        # Bar nur akzeptieren, wenn wirklich eindeutig erkannt
+        if zahl == "Bar" and not re.search(r"(?i)\b(bar|barzahlung|gegeben|wechselgeld|zurück)\b",
+                                           d.get("Rohtext", "")):
+            return "Prüfen: Zahlung unsicher"
+
+        return "OK"
     # 8) Excel schreiben (rtype wiederverwenden, nicht neu bestimmen)
     try:
         reviewed.setdefault("Belegtyp", rtype)
@@ -4110,6 +4157,27 @@ def scan_kassenbon_group(
             except Exception as e:
                 print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
+    def _status_from(d: dict) -> str:
+        betrag = d.get("Betrag (€)")
+        laden = d.get("Laden")
+        zahl = d.get("Zahlung")
+        rtype = d.get("Belegtyp")
+
+        if strict_total and (betrag in (None, "", 0)):
+            return "Prüfen: Betrag fehlt"
+
+        if _is_bad_store_name(laden):
+            return "Prüfen: Laden unsicher"
+
+        if rtype in (None, "", "generic"):
+            return "Prüfen: Typ unsicher"
+
+        # Bar nur akzeptieren, wenn wirklich eindeutig erkannt
+        if zahl == "Bar" and not re.search(r"(?i)\b(bar|barzahlung|gegeben|wechselgeld|zurück)\b",
+                                           d.get("Rohtext", "")):
+            return "Prüfen: Zahlung unsicher"
+
+        return "OK"
     # 7) Excel
     #try:
     #    rtype = detect_receipt_type(combo_text)
