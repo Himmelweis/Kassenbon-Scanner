@@ -13,7 +13,9 @@ Created on Sun Aug 31 19:14:15 2025
 import os, re, cv2, pytesseract, pandas as pd, numpy as np
 from datetime import datetime
 from PIL import Image
-
+import re
+from pathlib import Path
+from paddleocr import PaddleOCR
 # ========= Debug Switches (standard: aus) =========
 
 FAST = True
@@ -26,6 +28,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCAN_DIR = os.path.join(BASE_DIR, "Kassenbons")
 EXCEL_PATH = os.path.join(BASE_DIR, "kassenbons.xlsx")
+
+USE_PADDLE = True
+_PADDLE_OCR = None
 
 def _print_clean_head(label: str, text: str, n: int = 20):
     if not DEBUG_HEAD:
@@ -636,20 +641,21 @@ import re
 
 def apply_payment_detection(best: dict, combo_text: str, debug: bool = False) -> None:
     # Nur setzen, wenn noch leer
-    if not best.get("Zahlung"):
-        pay = detect_payment_method(combo_text)
+    if not USE_PADDLE:
+        if not best.get("Zahlung"):
+            pay = detect_payment_method(combo_text)
 
-        # Heuristik für Bar, wenn Gegeben/Wechselgeld plausibel
-        if not pay:
-            given  = best.get("Gegeben (€)")
-            change = best.get("Wechselgeld (€)")
-            low    = combo_text.lower()
-            if isinstance(given, (int, float)) and (
-                isinstance(change, (int, float)) or "wechselgeld" in low or "zurück" in low
-            ):
-                pay = "Bar"
-
-        best["Zahlung"] = pay if pay else "Unbekannt"
+            # Heuristik für Bar, wenn Gegeben/Wechselgeld plausibel
+            if not pay:
+                given  = best.get("Gegeben (€)")
+                change = best.get("Wechselgeld (€)")
+                low    = combo_text.lower()
+                if isinstance(given, (int, float)) and (
+                    isinstance(change, (int, float)) or "wechselgeld" in low or "zurück" in low
+                ):
+                    pay = "Bar"
+        # alte Fallbacks / Merge-Korrekturen
+            best["Zahlung"] = pay if pay else "Unbekannt"
 
     # Debug-Prints: exakt 1x pro Beleg
     if debug and DEBUG_PAYMENTS and not getattr(apply_payment_detection, "_did_log", False):
@@ -1938,12 +1944,13 @@ def extract_data_from_text(text: str) -> dict:
         if re.search(r"(apotheke|drogerie|markt|center|hagebau|aral|shell|bft|dm|rossmann|rewe|edeka|aldi|lidl|kajute|restaurant)", low):
             data["Laden"] = ln
             break
-    if "Laden" not in data or not data["Laden"]:
-        store_now = (data.get("Laden") or "").strip()
-        if (not store_now) or _is_bad_store_name(store_now) or store_now.upper() in {"IN","DER","IN DER","APOTHEKE"}:
-            store_guess = _guess_store_name(text)
-            if store_guess:
-                data["Laden"] = store_guess
+    if not USE_PADDLE:
+        if "Laden" not in data or not data["Laden"]:
+            store_now = (data.get("Laden") or "").strip()
+            if (not store_now) or _is_bad_store_name(store_now) or store_now.upper() in {"IN","DER","IN DER","APOTHEKE"}:
+                store_guess = _guess_store_name(text)
+                if store_guess:
+                    data["Laden"] = store_guess
     # --- Belegfuß-ROI: hier stehen meist MwSt/Netto/Brutto/Gesamt ---
     foot = _roi_lines(
         text,
@@ -2041,13 +2048,15 @@ def extract_data_from_text(text: str) -> dict:
     
     # 4) setzen, falls plausibel
     # --- BETRAG ---
-    # starker Fallback (holt z. B. „zu zahlen 25,01 EUR“)
-    if "Betrag (€)" not in data or not data["Betrag (€)"]:
-        def _is_plausible_amount(v: float) -> bool:
-            # keine gigantischen Zahlen (OCR „356.000Z“ → 35600.0)
-            if v <= 0 or v > 2000:  # Einkaufs-Bons >2000 € sind extrem selten
-                return False
-            return True
+    if not USE_PADDLE:
+    # alte Fallbacks / Merge-Korrekturen
+        # starker Fallback (holt z. B. „zu zahlen 25,01 EUR“)
+        if "Betrag (€)" not in data or not data["Betrag (€)"]:
+            def _is_plausible_amount(v: float) -> bool:
+                # keine gigantischen Zahlen (OCR „356.000Z“ → 35600.0)
+                if v <= 0 or v > 2000:  # Einkaufs-Bons >2000 € sind extrem selten
+                    return False
+                return True
 
     # ... beim Setzen von "Betrag (€)":
     tot = _pick_total_candidate(text)
@@ -2113,11 +2122,13 @@ def extract_data_from_text(text: str) -> dict:
         # Brutto ist fast immer der größte Wert im Fuß
         data["Betrag (€)"] = max(candidates)
 
-    # 3) Falls noch leer, letzter Fallback (ganzer Text, Keywords)
-    if "Betrag (€)" not in data or not data["Betrag (€)"]:
-        tot = _pick_total_candidate(text)
-        if tot is not None:
-            data["Betrag (€)"] = tot
+    if not USE_PADDLE:
+    # alte Fallbacks / Merge-Korrekturen
+        # 3) Falls noch leer, letzter Fallback (ganzer Text, Keywords)
+        if "Betrag (€)" not in data or not data["Betrag (€)"]:
+            tot = _pick_total_candidate(text)
+            if tot is not None:
+                data["Betrag (€)"] = tot
             
     # --- Zahlungsart ---
     if "Zahlung" not in data or not data["Zahlung"]:
@@ -2377,6 +2388,371 @@ def append_to_excel_typed(row: dict, rtype: str, excel_path: str = "kassenbons.x
 
 
 # ========= GUI Review & Helfer (OBERHALB von scan_kassenbon einfügen) =========
+def run_paddle_ocr(image_path: str) -> list[dict]:
+    """
+    Führt PaddleOCR auf einem Bild aus und gibt eine sortierte Liste von OCR-Zeilen zurück.
+    Jede Zeile ist ein Dict mit text, score, x1, y1, x2, y2, cx, cy.
+    """
+    global _PADDLE_OCR
+
+    if _PADDLE_OCR is None:
+        _PADDLE_OCR = PaddleOCR(
+            lang="en",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False
+        )
+
+    result = _PADDLE_OCR.predict(str(image_path))
+    if not result:
+        return []
+
+    page = result[0]
+    texts = page.get("rec_texts", [])
+    scores = page.get("rec_scores", [])
+    boxes = page.get("rec_boxes", [])
+
+    lines = []
+    for i, text in enumerate(texts):
+        if not text:
+            continue
+
+        score = float(scores[i]) if i < len(scores) else 0.0
+        box = boxes[i] if i < len(boxes) else None
+        if box is None:
+            continue
+
+        x1, y1, x2, y2 = map(int, box)
+
+        lines.append({
+            "text": str(text).strip(),
+            "score": score,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "cx": (x1 + x2) // 2,
+            "cy": (y1 + y2) // 2,
+        })
+
+    lines.sort(key=lambda d: (d["cy"], d["x1"]))
+    return lines
+
+def parse_receipt_blocks(lines: list[dict]) -> dict:
+    """
+    Parst PaddleOCR-Zeilen in ein Ergebnis-Dict.
+    Fokus: Laden, Adresse, Datum/Uhrzeit, Betrag, Gegeben, Wechselgeld,
+    MwSt, Netto, Zahlung.
+    """
+    import re
+
+    out = {}
+    if not lines:
+        return out
+
+    # -------------------------
+    # Vorbereiten
+    # -------------------------
+    lines = sorted(lines, key=lambda d: (d["cy"], d["x1"]))
+    max_y = max(ln["y2"] for ln in lines)
+    header_lines = [ln for ln in lines if ln["cy"] <= max_y * 0.22]
+
+    def _txt(ln):
+        return (ln.get("text") or "").strip()
+
+    def _money_matches(s: str, allow_negative: bool = True) -> list[tuple[str, float]]:
+        patt = r"(?<!\d)-?\d{1,4}[.,]\d{2}(?!\d)" if allow_negative else r"(?<!\d)\d{1,4}[.,]\d{2}(?!\d)"
+        found = []
+        for m in re.findall(patt, s):
+            try:
+                val = float(m.replace(",", "."))
+            except Exception:
+                continue
+            found.append((m, val))
+        return found
+
+    def _find_money_near(idx, window_before=2, window_after=2, allow_negative=True):
+        vals = []
+        start = max(0, idx - window_before)
+        end = min(len(lines), idx + window_after + 1)
+        for j in range(start, end):
+            txt2 = _txt(lines[j])
+            for raw, val in _money_matches(txt2, allow_negative=allow_negative):
+                vals.append((j, raw, val, txt2))
+        return vals
+
+    def _has_card_hint(txt: str) -> bool:
+        return any(k in txt for k in ["karte", "ec", "girocard", "mastercard", "visa", "karteec"])
+
+    # -------------------------
+    # Laden / Adresse
+    # -------------------------
+    bad_header_words = {
+        "rechnung", "artikelname", "menge", "einzel", "gesamt",
+        "summe", "gesamtsumme", "betrag", "datum", "uhrzeit"
+    }
+
+    store = None
+    address = None
+
+    for ln in header_lines:
+        txt = _txt(ln)
+        txt_low = txt.lower()
+
+        if not txt:
+            continue
+
+        if not store:
+            if (
+                len(txt) > 8
+                and any(c.isalpha() for c in txt)
+                and txt_low not in bad_header_words
+                and not re.fullmatch(r"[\d\s\-./]+", txt)
+            ):
+                store = txt
+                continue
+
+        if not address:
+            if any(ch.isdigit() for ch in txt) and any(c.isalpha() for c in txt):
+                address = txt
+
+    if store:
+        out["Laden"] = store
+    if address:
+        out["Adresse"] = address
+
+    # -------------------------
+    # Datum / Uhrzeit
+    # -------------------------
+    for ln in lines:
+        txt = _txt(ln)
+        if not txt:
+            continue
+
+        m = re.search(r"(\d{2}\.\d{2}\.\d{2,4}).*?(\d{2}:\d{2})", txt)
+        if m:
+            raw_date = m.group(1)
+            raw_time = m.group(2)
+
+            m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
+            if m_date:
+                dd, mm, yy = m_date.groups()
+                if len(yy) == 2:
+                    yy = "20" + yy
+                out["Datum"] = f"{yy}-{mm}-{dd}"
+
+            out["Uhrzeit"] = raw_time
+            break
+
+    # -------------------------
+    # Zahlung / Gegeben / Rückgeld
+    # -------------------------
+    payment = None
+    given_amount = None
+    change_amount = None
+
+    for i, ln in enumerate(lines):
+        txt = _txt(ln).lower()
+
+        # Karte hat Vorrang
+        if _has_card_hint(txt):
+            payment = "Karte"
+
+        # Rückgeld -> Bar
+        if any(k in txt for k in ["ruckgeld", "rückgeld", "zuruck", "zurück"]):
+            payment = "Bar"
+            nearby = _find_money_near(i, window_before=3, window_after=1, allow_negative=True)
+            negs = [x for x in nearby if x[2] < 0]
+            if negs:
+                change_amount = negs[-1][1]
+
+        # Gegeben nur dann als Bar interpretieren, wenn in derselben Zeile kein Kartenhinweis steht
+        if ("gegeben" in txt or txt == "bar" or "barzahlung" in txt) and not _has_card_hint(txt):
+            payment = "Bar"
+            nearby = _find_money_near(i, window_before=1, window_after=3, allow_negative=False)
+            pos = [x for x in nearby if x[2] > 0]
+            if pos:
+                pos.sort(key=lambda x: x[2])
+                given_amount = pos[-1][1]
+
+    # -------------------------
+    # Betrag
+    # -------------------------
+    total = None
+    total_keywords = [
+        "gesamtsumme", "summe", "summi", "gesamt",
+        "endbetrag", "zu zahlen", "zahlbetrag", "betrag"
+    ]
+
+    # 1) Summe-Zeilen bevorzugen
+    for i, ln in enumerate(lines):
+        txt = _txt(ln).lower()
+        if any(k in txt for k in total_keywords):
+            nearby = _find_money_near(i, window_before=1, window_after=2, allow_negative=False)
+            pos = [x for x in nearby if x[2] > 2.0]
+            if pos:
+                pos.sort(key=lambda x: x[2])  # kleineren plausiblen Wert nehmen
+                total = pos[0][1]
+                break
+
+    # 2) Fallback: Brutto-Zeile
+    if not total:
+        for i, ln in enumerate(lines):
+            txt = _txt(ln).lower()
+            if "brutto" in txt:
+                nearby = _find_money_near(i, window_before=0, window_after=3, allow_negative=False)
+                pos = [x for x in nearby if x[2] > 2.0]
+                if pos:
+                    pos.sort(key=lambda x: x[2], reverse=True)
+                    total = pos[0][1]
+                    break
+
+    # 3) Nur wenn Gegeben UND Wechselgeld da sind, daraus Betrag setzen
+    if payment == "Bar" and given_amount and change_amount:
+        try:
+            g = float(str(given_amount).replace(",", "."))
+            c = abs(float(str(change_amount).replace(",", ".")))
+            total = f"{g - c:.2f}".replace(".", ",")
+        except Exception:
+            pass
+
+    if total:
+        try:
+            out["Betrag (€)"] = float(str(total).replace(",", "."))
+        except Exception:
+            pass
+
+    # -------------------------
+    # Steuerblock
+    # -------------------------
+    tax_rate = None
+    tax_amount = None
+    net_amount = None
+    gross_from_tax = None
+
+
+    for i, ln in enumerate(lines):
+        txt = _txt(ln).lower()
+
+        if any(k in txt for k in ["mwst", "steuer", "steuersatz", "netto", "brutto"]):
+            nearby = _find_money_near(i, window_before=0, window_after=6, allow_negative=False)
+            vals = [(raw, val) for (_j, raw, val, _txt2) in nearby if val > 0]
+
+            # Steuersatz
+            if tax_rate is None:
+                for j in range(i, min(i + 6, len(lines))):
+                    t2 = _txt(lines[j])
+
+                    m_pct = re.search(r"\b(7|19)\s*%", t2)
+                    if m_pct:
+                        tax_rate = int(m_pct.group(1))
+                        break
+
+                    m_pct2 = re.search(r"[AB]?\s*(7|19)[.,]00", t2)
+                    if m_pct2:
+                        tax_rate = int(m_pct2.group(1))
+                        break
+
+            if vals:
+                # kleinster plausibler positiver Wert = Steuer
+                if tax_amount is None:
+                    smalls = [(r, v) for (r, v) in vals if 0 < v < 10]
+                    if smalls:
+                        smalls.sort(key=lambda x: x[1])
+                        tax_amount = smalls[0][0]
+
+                # Im Steuerblock liegen meist genau zwei große Werte:
+                # Brutto und Netto. Der größere ist Brutto, der kleinere Netto.
+                bigger = [(r, v) for (r, v) in vals if v >= 2]
+                if len(bigger) >= 2:
+                    bigger.sort(key=lambda x: x[1])
+                    net_amount = bigger[-2][0]  # kleinerer der beiden großen Werte
+                    gross_from_tax = bigger[-1][0]  # größerer der beiden großen Werte
+                elif len(bigger) == 1:
+                    # Fallback
+                    if gross_from_tax is None:
+                        gross_from_tax = bigger[0][0]
+
+    if tax_rate in (7, 19):
+        out["MwSt %"] = tax_rate
+
+    if tax_amount:
+        try:
+            out["MwSt (€)"] = float(str(tax_amount).replace(",", "."))
+        except Exception:
+            pass
+
+    # Netto zunächst nur als Fallback übernehmen
+    if net_amount:
+        try:
+            out["Netto (€)"] = float(str(net_amount).replace(",", "."))
+        except Exception:
+            pass
+
+    if gross_from_tax:
+        try:
+            gross_tax_val = float(str(gross_from_tax).replace(",", "."))
+            gross_now = out.get("Betrag (€)")
+            if not isinstance(gross_now, (int, float)) or abs(gross_now - gross_tax_val) > 0.05:
+                out["Betrag (€)"] = gross_tax_val
+        except Exception:
+            pass
+
+    # -------------------------
+    # Konsistenzkorrekturen
+    # -------------------------
+    gross = out.get("Betrag (€)")
+    vat = out.get("MwSt (€)")
+    net = out.get("Netto (€)")
+
+    # Wenn Brutto und MwSt da sind, Netto IMMER daraus ableiten.
+    if isinstance(gross, (int, float)) and isinstance(vat, (int, float)):
+        calc_net = round(gross - vat, 2)
+        if not isinstance(net, (int, float)) or abs(net - calc_net) > 0.05:
+            out["Netto (€)"] = calc_net
+
+    # Gegeben / Wechselgeld schreiben
+    if given_amount:
+        try:
+            out["Gegeben (€)"] = float(str(given_amount).replace(",", "."))
+        except Exception:
+            pass
+
+    if change_amount:
+        try:
+            out["Wechselgeld (€)"] = abs(float(str(change_amount).replace(",", ".")))
+        except Exception:
+            pass
+
+    if payment:
+        out["Zahlung"] = payment
+
+    # Kartenzahlung: keine Gegeben/Wechselgeld-Felder mitschleppen
+    if out.get("Zahlung") == "Karte":
+        out.pop("Gegeben (€)", None)
+        wechsel = out.get("Wechselgeld (€)")
+        if wechsel in (0, 0.0):
+            out.pop("Wechselgeld (€)", None)
+
+    # Barzahlung: nur wenn Gegeben + Wechselgeld wirklich da sind, Betrag daraus setzen
+    if out.get("Zahlung") == "Bar":
+        gegeben = out.get("Gegeben (€)")
+        wechsel = out.get("Wechselgeld (€)")
+        if isinstance(gegeben, (int, float)) and isinstance(wechsel, (int, float)):
+            out["Betrag (€)"] = round(gegeben - wechsel, 2)
+
+    # Rohtext immer mitgeben
+    out["Rohtext"] = "\n".join(_txt(ln) for ln in lines if _txt(ln))
+
+    return out
+
+def extract_data_with_paddle(image_path: str) -> dict:
+    """
+    Führt PaddleOCR + Blockparser aus und liefert ein Ergebnis-Dict.
+    """
+    lines = run_paddle_ocr(image_path)
+    return parse_receipt_blocks(lines)
+#-----------Paddle Code Ende ---------------------
+
 def _clean_head_lines(text: str, n_lines: int = 15) -> list[str]:
     """
     Nimmt die ersten n Zeilen, filtert Müll (kurze Tokens, viel Sonderzeichen),
@@ -2934,21 +3310,23 @@ def extract_data_fuel(text: str) -> dict:
                         out["Betrag (€)"] = _norm_money(m_named.group("brutto"))    # **wichtig**: Brutto als Betrag
                     except: pass
 
-            # 4) Endbetrag-Fallback (falls obige Zeile doch nicht greift)
-            if "Betrag (€)" not in out or not out["Betrag (€)"]:
-                m_end = re.search(r"(?i)\bEndbetrag[^\d]{0,20}" + money, text)
-                if m_end:
-                    try: out["Betrag (€)"] = _norm_money(m_end.group(1))
-                    except: pass
-                else:
-                    # Zeile mit drei Beträgen und "*Endbetrag" am Ende
-                    m_end2 = re.search(
-                        r"(?i)^{m}\s+{m}\s+({m})\s*\*?Endbetrag\s*$".format(m=money),
-                        text, re.M
-                    )
-                    if m_end2:
-                        try: out["Betrag (€)"] = _norm_money(m_end2.group(1))
+            if not USE_PADDLE:
+            # alte Fallbacks / Merge-Korrekturen
+                # 4) Endbetrag-Fallback (falls obige Zeile doch nicht greift)
+                if "Betrag (€)" not in out or not out["Betrag (€)"]:
+                    m_end = re.search(r"(?i)\bEndbetrag[^\d]{0,20}" + money, text)
+                    if m_end:
+                        try: out["Betrag (€)"] = _norm_money(m_end.group(1))
                         except: pass
+                    else:
+                        # Zeile mit drei Beträgen und "*Endbetrag" am Ende
+                        m_end2 = re.search(
+                            r"(?i)^{m}\s+{m}\s+({m})\s*\*?Endbetrag\s*$".format(m=money),
+                            text, re.M
+                        )
+                        if m_end2:
+                            try: out["Betrag (€)"] = _norm_money(m_end2.group(1))
+                            except: pass
 
             # 5) Netto/MwSt-Überschriften (falls Variante mit Spaltentitel)
             if "Netto (€)" not in out:
@@ -3465,12 +3843,14 @@ def extract_data_grocery(text: str) -> dict:
         try: data["Wechselgeld (€)"] = _norm_money(m.group(2))
         except: pass
 
-    # Lidl hat häufig genau "Betrag 216,02 EUR" – mit dem fangen wir zusätzlich ab:
-    if "Betrag" in text and "Betrag (€)" not in data:
-        m2 = re.search(rf"(?im)\bBetrag\b[^\d]{{0,20}}{money}", text)
-        if m2:
-            try: data["Betrag (€)"] = _norm_money(m2.group(1))
-            except: pass
+    if not USE_PADDLE:
+    # alte Fallbacks / Merge-Korrekturen
+        # Lidl hat häufig genau "Betrag 216,02 EUR" – mit dem fangen wir zusätzlich ab:
+        if "Betrag" in text and "Betrag (€)" not in data:
+            m2 = re.search(rf"(?im)\bBetrag\b[^\d]{{0,20}}{money}", text)
+            if m2:
+                try: data["Betrag (€)"] = _norm_money(m2.group(1))
+                except: pass
 
     # Fußbereich: Zeilen mit % sammeln
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -3635,11 +4015,6 @@ def extract_data_grocery(text: str) -> dict:
         if isinstance(val, (int,float)):
             data["Wechselgeld (€)"] = val
 
-
-# =================== High-Level ===================
-
-STRICT_TOTAL = True  # Betrag fehlt → zwingend Review
-
 def scan_kassenbon(
     image_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -3647,249 +4022,160 @@ def scan_kassenbon(
     strict_total: bool = True,
     show_debug_footer: bool = True
 ):
-    import os, re
-    
+    import os
+    import re
+
     _reset_payment_log_once()
 
     if not os.path.isfile(image_path):
         print(f"❗ Bild nicht gefunden: {image_path}")
         return None
 
-    # 1) OCR-Varianten
-    texts = ocr_text_multi(image_path)
+    # =========================
+    # OCR + Parsing
+    # =========================
+    if USE_PADDLE:
+        lines = run_paddle_ocr(image_path)
+        texts = [ln["text"] for ln in lines]
+        combined_text = "\n".join(texts)
+
+        best = parse_receipt_blocks(lines)
+
+        #print("\n=== DEBUG PADDLE RAW ===")
+        #print(best)
+
+        if not best:
+            print("❗ PaddleOCR lieferte kein Ergebnis.")
+            return None
+
+        best["Rohtext"] = combined_text
+
+        # Belegtyp nur ergänzen, nicht überschreiben
+        if not best.get("Belegtyp"):
+            txt_up = combined_text.upper()
+
+            if re.search(r"\b(HAGEBAU|OBI|BAUHAUS|HORNBACH)\b", txt_up):
+                best["Belegtyp"] = "retail"
+            elif re.search(r"\b(BÄCKEREI|BACKHAUS|BACKSTUBE|KONDITOREI)\b", txt_up):
+                best["Belegtyp"] = "retail"
+            elif re.search(r"\b(LIDL|ALDI|EDEKA|REWE|NORMA|NETTO|PENNY|KAUFLAND)\b", txt_up):
+                best["Belegtyp"] = "grocery"
+            elif re.search(r"\b(APOTHEKE)\b", txt_up):
+                best["Belegtyp"] = "pharmacy"
+            elif re.search(r"\b(ARAL|SHELL|JET|ESSO|TOTAL|BFT)\b", txt_up):
+                best["Belegtyp"] = "fuel"
+            else:
+                best["Belegtyp"] = "generic"
+
+        rtype = best.get("Belegtyp", "generic")
+
+    else:
+        texts = ocr_text_multi(image_path)
+        if not texts:
+            print("❗ Keine OCR-Texte erhalten.")
+            return None
+
+        combined_text = "\n".join(texts)
+
+        parsed = []
+        for tx in texts:
+            try:
+                parsed.append(extract_data_from_text(tx) | {"Rohtext": tx})
+            except Exception:
+                parsed.append({"Rohtext": tx})
+
+        rtype = detect_receipt_type(combined_text) if 'detect_receipt_type' in globals() else "generic"
+        best = merge_variant_dicts(parsed, receipt_type=rtype)
+
+        # Nur im Tesseract-Zweig alte Fallbacks
+        if not best.get("Betrag (€)"):
+            tot = _pick_total_candidate(combined_text)
+            if tot is not None:
+                best["Betrag (€)"] = tot
+
+        if not best.get("Laden"):
+            store_guess = _guess_store_name(combined_text)
+            if store_guess:
+                best["Laden"] = store_guess
+
+        pay = majority_payment(texts)
+        if pay and (not best.get("Zahlung") or best["Zahlung"] in ("Unbekannt", "")):
+            best["Zahlung"] = pay
+
     if not texts:
         print("❗ Keine OCR-Texte erhalten.")
         return None
 
-    # 2) CLEAN/RAW kombinieren
-    combo_raw  = "\n".join(texts)
+    # =========================
+    # Gemeinsame Nachbearbeitung
+    # =========================
+    combo_raw = "\n".join(texts)
     combo_text = safe_post_ocr_cleanup(combo_raw)
-    _print_clean_head("", combo_text, n=20)
 
-
-    # --- Kopf aus CLEAN-Text untersuchen ---
-    head_lines = _clean_head_lines(combo_text, n_lines=15)
-    store_guess = _best_store_from_head(head_lines)
-    print("\n--- CLEAN HEAD (for store) ---")
-    for ln in [l for l in combo_text.splitlines() if l.strip()][:12]:
-        print(ln)
-    cand_store = _guess_store_name_head(combo_text)
-    print(f"STORE-CANDIDATE: {cand_store!r}")
-
-    # Debug: Fuß / Tail
     if show_debug_footer:
-        def _grep_footer(s: str) -> str:
-            return "\n".join(ln for ln in s.splitlines()
-                             if re.search(r"(Gesamt|Betrag|Summe|Gegeben|Zurück|Netto|Brutto|MwSt)", ln, re.I))
-        print("\n--- CLEAN Fuß ---")
-        for ln in combo_text.splitlines()[-8:]:
+        print("\n--- CLEAN HEAD ---")
+        for ln in combo_text.splitlines()[:20]:
             print(ln)
 
-    print("\n--- CLEAN (letzte 80 Zeilen) ---")
-    for ln in combo_text.splitlines()[-80:]:
-        print(ln)
+        print("\n--- CLEAN (letzte 40 Zeilen) ---")
+        for ln in combo_text.splitlines()[-40:]:
+            print(ln)
 
-    # 3) Parsing + Merge (hier entsteht 'best')
-    parsed = []
-    for tx in texts:
-        try:
-            parsed.append(extract_data_from_text(tx) | {"Rohtext": tx})
-        except Exception:
-            parsed.append({"Rohtext": tx})
-
-    rtype = detect_receipt_type(combo_text) if 'detect_receipt_type' in globals() else "generic"
-    best = merge_variant_dicts(parsed, receipt_type=rtype)
-
-    # Betrag sanity
-    if best.get("Betrag (€)"):
-        best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
-
-    # Store-Fallback aus Foot/Domain (z.B. LIDL)
-    if not best.get("Laden") or len(best["Laden"]) < 3 or " " not in best["Laden"]:
-        s_fallback = _guess_store_name(combo_text)
-        if s_fallback:
-            best["Laden"] = s_fallback
-
-    # --- Store-basierter Typ-Override ---
-    forced = coerce_type_by_store(best.get("Laden") or "")
-    if forced:
-        rtype = forced
-    best["Belegtyp"] = rtype
-
-    # --- Store-basierter Override ---
-    forced = coerce_type_by_store(best.get("Laden"))
-    if forced:
-        rtype = forced
-
-    # --- Store-basierter Typ-Override ---
-    store = (best.get("Laden") or "").upper()
-    if re.search(r"\b(NIELSEN|SCAN-?SHOP)\b", store):
-        rtype = "grocery"  # erzwingen
-
-    pay = majority_payment(texts)
-    if pay and (not best.get("Zahlung") or best["Zahlung"] in ("Unbekannt","")):
-        best["Zahlung"] = pay
-
-    # --- Betrag-Fallback (direkt nach Merge, VOR Typ-Nachschärfen!) ---
+    # Laden nur säubern, nicht hart überschreiben
     clean_head = "\n".join([ln for ln in combo_text.splitlines() if ln.strip()][:20])
     best["Laden"] = _sanitize_store_name(best.get("Laden"), clean_head) or best.get("Laden")
 
-    money = r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
-    if not best.get("Betrag (€)"):
-        # a) bevorzugt: „Betrag / Summe / Gesamt / Zu zahlen“
-        m = re.search(
-            rf"(?ims)\b(zu\s*zahlen|endbetrag|gesamt|summe|betrag)\b"
-            rf"[^\d]{{0,60}}{money}\s*(?:€|eur)?\b",
-            combo_text
-        )
-        if m:
-            try:
-                best["Betrag (€)"] = _norm_money(m.group(2))
-            except Exception:
-                pass
-    # Laden aus Kopf priorisieren (z.B. 'Nielsen SCAN-SHOP')
-    # --- Laden robuster nachschärfen (Header & Footer kombiniert) ---
-    store_now = best.get("Laden")
-    if _store_is_bad(store_now):
-        # erst strikte Kopf-Erkennung
-        cand_head = _guess_store_name_strict(combo_text)
-        if cand_head and not _store_is_bad(cand_head):
-            best["Laden"] = cand_head
-        else:
-            # dann Footer-Heuristik: „Einkauf getätigt in …“
-            cand_foot = _extract_store_from_footer(combo_text)
-            if cand_foot and not _store_is_bad(cand_foot):
-                best["Laden"] = cand_foot
+    # Store-basierten Typ nur ergänzen, nicht blind überschreiben
+    forced = coerce_type_by_store(best.get("Laden") or "")
+    if forced and (not best.get("Belegtyp") or best.get("Belegtyp") == "generic"):
+        best["Belegtyp"] = forced
+        rtype = forced
 
-    # Lidl-Spezial: wenn Lidl/Lidl Pay im Text und kein vernünftiger Name → Lidl <Ort> aus Footer
-    if _store_is_bad(best.get("Laden")):
-        if re.search(r"(?i)\bLIDL\b", combo_text) or re.search(r"(?i)LIDL\s*PAY", combo_text):
-            cand_foot = _extract_store_from_footer(combo_text)
-            if cand_foot:
-                best["Laden"] = cand_foot
-            else:
-                best["Laden"] = "Lidl"
+    # Keine unbekannte Zahlung erzwingen
+    if not best.get("Zahlung"):
+        best["Zahlung"] = ""
 
-    # b) wenn immer noch nix: nimm größte Summe im unteren Textbereich
-    if not best.get("Betrag (€)"):
-        tail = "\n".join(combo_text.splitlines()[-80:])
-        amts = re.findall(money, tail)
-        amts = [_norm_money(a) for a in amts if a]
-        if amts:
-            best["Betrag (€)"] = max(amts)
+    # 0-Beträge verwerfen
+    if best.get("Betrag (€)") in (0, 0.0, "0", "0,00"):
+        best.pop("Betrag (€)", None)
 
-    if not best.get("Betrag (€)"):
-        m2 = re.search(r"(?ims)\b(betrag|summe|gesamt|zu\s*zahlen)\b.*?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*(?:€|eur)?", combo_text)
-        if m2:
-            try: best["Betrag (€)"] = _norm_money(m2.group(2))
-            except: pass
+    # Sanitizer nur auf vorhandene Beträge anwenden
+    if best.get("Betrag (€)"):
+        best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
 
-    if not best.get("Betrag (€)"):
-        money = r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
-        import re
-        # alle Texte zusammensuchen
-        all_txt = (combo_text or "") + "\n" + "\n".join(texts or [])
-        amounts = re.findall(rf"{money}\s*(?:€|eur)\b", all_txt, flags=re.I)
-        amounts = [_norm_money(a) for a in amounts if a]
-        if amounts:
-            best["Betrag (€)"] = max(amounts)
+    print("\n=== DEBUG VOR STATUS ===")
+    print(best)
 
-    if cand_store:
-        best["Laden"] = cand_store  # erzwingen
-
-
-    # --- Laden-Fallback/Override (SCAN-SHOP/Nielsen) ---
-    bad_stores = {"in","der","in der","apotheke","fatal","da a wa","zn nm m mm x ua"}
-
-    store_hdr = _guess_store_from_header(combo_text)
-    brand_any = _brand_from_anywhere(combo_text) if ' _brand_from_anywhere' in str(globals()) else None
-
-    proposed = store_hdr or brand_any  # Header hat Vorrang (liefert ggf. 'Nielsen SCAN-SHOP')
-    cur = (best.get("Laden") or "").strip()
-
-    if (not cur) or cur.lower() in bad_stores or len(cur) < 3:
-        if proposed:
-            best["Laden"] = proposed
-
-
-    # Laden nur überschreiben, wenn leer/unsinnig
-    bad_stores = {"in","der","in der","apotheke","fatal","da a wa"}
-    cur = (best.get("Laden") or "").strip().lower()
-    if (not cur) or cur in bad_stores or len(cur) < 3:
-        if store_guess:
-            best["Laden"] = store_guess
-
-
-    # 4) Laden/Datum-Fallbacks (auf Basis combo_text/combo_raw)
-    if (not best.get("Laden")) or (best["Laden"].strip().upper() in {"IN","DER","IN DER","APOTHEKE"}):
-        store = _guess_store_name(combo_text) or _guess_store_name(combo_raw)
-        if store:
-            best["Laden"] = store
-
-    if not best.get("Datum"):
-        d = _parse_date_loose(combo_text) or _parse_date_loose(combo_raw)
-        if d:
-            best["Datum"] = d
-
-
-    # 5) Typ-spezifisches Nachschärfen (baut auf Betrag/Laden/Datum auf)
-    try:
-        if rtype == "restaurant" and 'extract_data_restaurant' in globals():
-            spec = extract_data_restaurant(combo_text) or {}
-        elif rtype == "fuel" and 'extract_data_fuel' in globals():
-            spec = extract_data_fuel(combo_text) or {}
-        elif rtype == "grocery" and 'extract_data_grocery' in globals():
-            spec = extract_data_grocery(combo_text) or {}
-        else:
-            spec = {}
-
-        for k, v in (spec or {}).items():
-            if v not in (None, "", 0):
-                best[k] = v
-
-    except Exception as e:
-        print(f"⚠️ Typ-Nachschärfung fehlgeschlagen: {e}")
-
-    apply_payment_detection(best, combo_text, debug=True)
-
-    # 6) Prüfstatus auf Basis des finalen 'best'
+    # =========================
+    # Prüfstatus
+    # =========================
     def _status_from(d: dict) -> str:
         betrag = d.get("Betrag (€)")
-        if strict_total and (betrag in (None, "", 0)):
-            return "Prüfen: Betrag fehlt"
+        laden = d.get("Laden")
+        zahl = d.get("Zahlung")
+        typ = d.get("Belegtyp")
+
+        if betrag in (None, "", 0, 0.0):
+            return "Prüfen: Betrag fehlt/unsicher"
+
+        if not laden or len(str(laden).strip()) < 4:
+            return "Prüfen: Laden unsicher"
+
+        if not typ or typ == "generic":
+            return "Prüfen: Typ unsicher"
+
+        if not zahl:
+            return "Prüfen: Zahlung fehlt"
+
         return "OK"
 
     pruefstatus = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
 
-    # Laden säubern (verhindert "Fatal"/"Total"/Betragszeilen als Laden)
-    clean_head = "\n".join([ln for ln in combo_text.splitlines() if ln.strip()][:20])
-    best["Laden"] = _sanitize_store_name(best.get("Laden"), clean_head) or best.get("Laden")
-
-    # --- Betrag an Zahlungszeile ausrichten, falls abweichend ---
-    try:
-        pay_ref = None
-        import re
-        MNY = _money_regex()
-        m = re.search(rf"(?i)\b(girocard|gegeben|bar(?:zahlung)?|gezahlt)\b[^\d]{{0,40}}{MNY}\s*(?:€|EUR)?", combo_text)
-        if m:
-            pay_ref = _norm_money(m.group(2))
-        given = best.get("Gegeben (€)")
-        total = best.get("Betrag (€)")
-        # Wenn „Gegeben“ existiert, ist das sehr oft der Endbetrag bei Kartenzahlung
-        ref = given if isinstance(given, (int,float)) else pay_ref
-        if isinstance(ref, (int, float)):
-            if not isinstance(total, (int,float)) or abs(ref - float(total)) >= 0.01:
-                best["Betrag (€)"] = round(float(ref), 2)
-    except Exception:
-        pass
-
-    # 7) Optionaler Review-Dialog (falls gewünscht/erforderlich)
+    # =========================
+    # Optionaler Review-Dialog
+    # =========================
     reviewed = best
-    print("\n--- CLEAN HEAD ---")
-    for ln in combo_text.splitlines()[:25]:
-        print(ln)
-
     if 'review_and_correct' in globals():
         want_review = (
             review_when.lower() == "immer" or
@@ -3901,100 +4187,28 @@ def scan_kassenbon(
             except Exception as e:
                 print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
-    def _sanitize_amounts(d: dict):
-        total = d.get("Betrag (€)")
-        def num(x): return x if isinstance(x,(int,float)) else None
-
-        # realistische Grenzen (deutsche USt max ~16% vom Brutto-Anteil)
-        mw = num(d.get("MwSt (€)"))
-        if total and mw is not None:
-            # wenn Steuer > 0.2 * Gesamt, verwerfen (zu groß)
-            if mw < 0 or mw > total * 0.20:
-                d["MwSt (€)"] = None
-
-        nt = num(d.get("Netto (€)"))
-        if total and nt is not None:
-            # Netto kann nicht > Brutto sein
-            if nt < 0 or nt > total:
-                d["Netto (€)"] = None
-
-        # Konsistenz: falls sowohl Netto als auch MwSt da sind, prüfe Summe ~ Brutto
-        nt = num(d.get("Netto (€)"))
-        mw = num(d.get("MwSt (€)"))
-        if total and nt is not None and mw is not None:
-            if not (total*0.90 <= nt+mw <= total*1.02):
-                # inkonsistent -> Steuer zuerst verwerfen
-                d["MwSt (€)"] = None
-                # Netto nochmals gegen Brutto deckeln
-                if d.get("Netto (€)") and d["Netto (€)"] > total:
-                    d["Netto (€)"] = None
-
-    _sanitize_amounts(best)
-
-    # Uhrzeit-Fallback (falls leer geworden)
-    if not best.get("Uhrzeit"):
-        t = _parse_time_loose(combo_text) or _parse_time_loose(combo_raw)
-        if t: best["Uhrzeit"] = t
-
+    # Werte noch einmal säubern
     try:
         reviewed = _sanitize_dict_values(reviewed)
     except Exception:
         pass
-    def _validate_time_in_context(t: str | None, text: str) -> str | None:
-        import re
-        if not t: 
-            return None
-        # Zeile mit der Uhrzeit finden
-        lines = [ln for ln in text.splitlines()]
-        idx = None
-        for i, ln in enumerate(lines):
-            if t in ln:
-                idx = i; break
-        if idx is None:
-            return t
-        window = "\n".join(lines[max(0, idx-2): idx+3])
-        if re.search(r"(?i)(%|\d,\d{2}|öffnungs|uhr|bis|mo\.?|di\.?|mi\.?|do\.?|fr\.?|sa\.?|so\.?|girocard|eur|€)", window):
-            return None
-        return t
 
-    best["Uhrzeit"] = _validate_time_in_context(best.get("Uhrzeit"), combo_text)
+    # Wenn Review den Typ nicht setzt, den erkannten Typ verwenden
+    reviewed.setdefault("Belegtyp", rtype)
 
-    print("\n--- DEBUG CHOICES ---")
-    print("Laden:", best.get("Laden"))
-    print("Datum:", best.get("Datum"), "Uhrzeit:", best.get("Uhrzeit"))
-    print("Betrag:", best.get("Betrag (€)"))
+    print("\n=== DEBUG VOR EXCEL ===")
+    print(reviewed)
 
-    def _status_from(d: dict) -> str:
-        betrag = d.get("Betrag (€)")
-        laden = d.get("Laden")
-        zahl = d.get("Zahlung")
-        rtype = d.get("Belegtyp")
-
-        if strict_total and (betrag in (None, "", 0)):
-            return "Prüfen: Betrag fehlt"
-
-        if _is_bad_store_name(laden):
-            return "Prüfen: Laden unsicher"
-
-        if rtype in (None, "", "generic"):
-            return "Prüfen: Typ unsicher"
-
-        # Bar nur akzeptieren, wenn wirklich eindeutig erkannt
-        if zahl == "Bar" and not re.search(r"(?i)\b(bar|barzahlung|gegeben|wechselgeld|zurück)\b",
-                                           d.get("Rohtext", "")):
-            return "Prüfen: Zahlung unsicher"
-
-        return "OK"
-    # 8) Excel schreiben (rtype wiederverwenden, nicht neu bestimmen)
+    # =========================
+    # Excel schreiben
+    # =========================
     try:
-        reviewed.setdefault("Belegtyp", rtype)
-        append_to_excel_typed(reviewed, rtype, excel_path=excel_path)
+        append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
         print(f"✅ Gespeichert nach: {excel_path}")
     except Exception as e:
         print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
 
     return reviewed
-
 
 def scan_kassenbon_group(
     image_paths: list[str],
@@ -4138,9 +4352,26 @@ def scan_kassenbon_group(
     # 5) Prüfstatus
     def _status_from(d: dict) -> str:
         betrag = d.get("Betrag (€)")
-        if strict_total and (betrag in (None, "", 0)):
-            return "Prüfen: Betrag fehlt"
+        laden = d.get("Laden")
+        zahl = d.get("Zahlung")
+        rtype = d.get("Belegtyp")
+
+        if betrag in (None, "", 0, 0.0):
+            return "Prüfen: Betrag fehlt/unsicher"
+
+        if not laden or len(str(laden).strip()) < 4:
+            return "Prüfen: Laden unsicher"
+
+        if not rtype or rtype == "generic":
+            return "Prüfen: Typ unsicher"
+
+        if not zahl:
+            return "Prüfen: Zahlung fehlt"
+
         return "OK"
+
+    #print("\n=== DEBUG VOR STATUS 3 ===")
+    #print(best)
     status = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if status.upper().startswith("OK") else f"🔎 {status}"
 
@@ -4163,21 +4394,20 @@ def scan_kassenbon_group(
         zahl = d.get("Zahlung")
         rtype = d.get("Belegtyp")
 
-        if strict_total and (betrag in (None, "", 0)):
-            return "Prüfen: Betrag fehlt"
+        if betrag in (None, "", 0, 0.0):
+            return "Prüfen: Betrag fehlt/unsicher"
 
-        if _is_bad_store_name(laden):
+        if not laden or len(str(laden).strip()) < 4:
             return "Prüfen: Laden unsicher"
 
-        if rtype in (None, "", "generic"):
+        if not rtype or rtype == "generic":
             return "Prüfen: Typ unsicher"
 
-        # Bar nur akzeptieren, wenn wirklich eindeutig erkannt
-        if zahl == "Bar" and not re.search(r"(?i)\b(bar|barzahlung|gegeben|wechselgeld|zurück)\b",
-                                           d.get("Rohtext", "")):
-            return "Prüfen: Zahlung unsicher"
+        if not zahl:
+            return "Prüfen: Zahlung fehlt"
 
         return "OK"
+
     # 7) Excel
     #try:
     #    rtype = detect_receipt_type(combo_text)
@@ -4199,6 +4429,8 @@ def scan_kassenbon_group(
 
     # --- Excel nur HIER (einmal) schreiben ---
     try:
+        print("\n=== DEBUG VOR EXCEL 2 ===")
+        print(best)
         append_to_excel_typed(best, rtype, excel_path=excel_path)
         print(f"✅ Gespeichert nach: {excel_path}")
     except Exception as e:
@@ -4217,6 +4449,8 @@ def batch_scan(folder: str, excel_path=EXCEL_PATH, review_when="prüfen"):
         if res and res.get("Prüfstatus") == review_when:
             res2 = review_and_correct(res, res.get("Rohtext",""))
             if res2:
+                print("\n=== DEBUG VOR EXCEL 3 ===")
+                print(best)
                 append_to_excel(res2, excel_path=excel_path)
 
 # =================== Batch-Scan (kompletter Block) ===================
@@ -4433,10 +4667,26 @@ def scan_pdf_receipt(
         # 6) Prüfstatus
         def _status_from(d: dict) -> str:
             betrag = d.get("Betrag (€)")
-            if strict_total and (betrag in (None, "", 0)):
-                return "Prüfen: Betrag fehlt"
+            laden = d.get("Laden")
+            zahl = d.get("Zahlung")
+            rtype = d.get("Belegtyp")
+
+            if betrag in (None, "", 0, 0.0):
+                return "Prüfen: Betrag fehlt/unsicher"
+
+            if not laden or len(str(laden).strip()) < 4:
+                return "Prüfen: Laden unsicher"
+
+            if not rtype or rtype == "generic":
+                return "Prüfen: Typ unsicher"
+
+            if not zahl:
+                return "Prüfen: Zahlung fehlt"
+
             return "OK"
 
+        print("\n=== DEBUG VOR STATUS 5 ===")
+        print(best)
         pruefstatus = _status_from(best)
         best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
 
@@ -4456,6 +4706,8 @@ def scan_pdf_receipt(
         # 8) Excel schreiben
         try:
             reviewed.setdefault("Belegtyp", rtype)
+            print("\n=== DEBUG VOR EXCEL 4 ===")
+            print(best)
             append_to_excel_typed(reviewed, rtype, excel_path=excel_path)
             print(f"✅ Gespeichert nach: {excel_path}")
         except Exception as e:
@@ -4531,6 +4783,7 @@ def batch_scan_folder(folder: str,
                 )
             else:
                 # Mehrteiliger Bon (mehrere Bilder)
+                print(f"\n=== scan_kassenbon_group AKTIV: {image_paths} | USE_PADDLE={USE_PADDLE} ===")
                 result = scan_kassenbon_group(
                     paths,
                     excel_path=excel_path,
