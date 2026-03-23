@@ -2523,6 +2523,10 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
     # -------------------------
     # Datum / Uhrzeit
     # -------------------------
+    found_date = None
+    found_time = None
+
+    # 1) zuerst kombinierte Zeilen suchen
     for ln in lines:
         txt = _txt(ln)
         if not txt:
@@ -2530,18 +2534,38 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
 
         m = re.search(r"(\d{2}\.\d{2}\.\d{2,4}).*?(\d{2}:\d{2})", txt)
         if m:
-            raw_date = m.group(1)
-            raw_time = m.group(2)
-
-            m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
-            if m_date:
-                dd, mm, yy = m_date.groups()
-                if len(yy) == 2:
-                    yy = "20" + yy
-                out["Datum"] = f"{yy}-{mm}-{dd}"
-
-            out["Uhrzeit"] = raw_time
+            found_date = m.group(1)
+            found_time = m.group(2)
             break
+
+    # 2) falls nicht gefunden: getrennte Zeilen suchen, bevorzugt im unteren Bereich
+    if not found_date or not found_time:
+        for i in range(len(lines) - 1, -1, -1):
+            txt = _txt(lines[i])
+
+            if not found_time:
+                m_time = re.search(r"\b(\d{2}:\d{2})\b", txt)
+                if m_time:
+                    found_time = m_time.group(1)
+
+            if not found_date:
+                m_date = re.search(r"\b(\d{2}\.\d{2}\.\d{2,4})\b", txt)
+                if m_date:
+                    found_date = m_date.group(1)
+
+            if found_date and found_time:
+                break
+
+    if found_date:
+        m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", found_date)
+        if m_date:
+            dd, mm, yy = m_date.groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+            out["Datum"] = f"{yy}-{mm}-{dd}"
+
+    if found_time:
+        out["Uhrzeit"] = found_time
 
     # -------------------------
     # Zahlung / Gegeben / Rückgeld
@@ -2624,11 +2648,11 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
     # -------------------------
     # Steuerblock
     # -------------------------
+    tax_rates_found = set()
     tax_rate = None
     tax_amount = None
     net_amount = None
     gross_from_tax = None
-
 
     for i, ln in enumerate(lines):
         txt = _txt(ln).lower()
@@ -2638,19 +2662,16 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
             vals = [(raw, val) for (_j, raw, val, _txt2) in nearby if val > 0]
 
             # Steuersatz
-            if tax_rate is None:
-                for j in range(i, min(i + 6, len(lines))):
-                    t2 = _txt(lines[j])
+            for j in range(i, min(i + 6, len(lines))):
+                t2 = _txt(lines[j])
 
-                    m_pct = re.search(r"\b(7|19)\s*%", t2)
-                    if m_pct:
-                        tax_rate = int(m_pct.group(1))
-                        break
+                m_pct = re.search(r"\b(7|19)\s*%", t2)
+                if m_pct:
+                    tax_rates_found.add(int(m_pct.group(1)))
 
-                    m_pct2 = re.search(r"[AB]?\s*(7|19)[.,]00", t2)
-                    if m_pct2:
-                        tax_rate = int(m_pct2.group(1))
-                        break
+                m_pct2 = re.search(r"[AB]?\s*(7|19)[.,]00", t2)
+                if m_pct2:
+                    tax_rates_found.add(int(m_pct2.group(1)))
 
             if vals:
                 # kleinster plausibler positiver Wert = Steuer
@@ -2672,8 +2693,15 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
                     if gross_from_tax is None:
                         gross_from_tax = bigger[0][0]
 
-    if tax_rate in (7, 19):
+    if len(tax_rates_found) == 1:
+        tax_rate = list(tax_rates_found)[0]
         out["MwSt %"] = tax_rate
+    else:
+        # gemischte Steuersätze → nicht global setzen
+        tax_rate = None
+        out.pop("MwSt %", None)
+        out.pop("MwSt (€)", None)
+        out.pop("Netto (€)", None)
 
     if tax_amount:
         try:
@@ -2742,6 +2770,17 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
 
     # Rohtext immer mitgeben
     out["Rohtext"] = "\n".join(_txt(ln) for ln in lines if _txt(ln))
+
+    # Gemischte Steuersätze -> globale MwSt-Felder nicht setzen
+    raw_up = out.get("Rohtext", "").upper()
+
+    has_7 = bool(re.search(r"\b7\s*%", raw_up)) or "A 7" in raw_up or "7,00" in raw_up
+    has_19 = bool(re.search(r"\b19\s*%", raw_up)) or "B 19" in raw_up or "19,00" in raw_up
+
+    if has_7 and has_19:
+        out.pop("MwSt %", None)
+        out.pop("MwSt (€)", None)
+        out.pop("Netto (€)", None)
 
     return out
 
@@ -3140,16 +3179,16 @@ def extract_data_fuel(text: str) -> dict:
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
 
     # --- Datum / Uhrzeit ---
-    if '._parse_date_loose' in dir():  # defensive, falls umbenannt
-        d = _parse_date_loose(s)
-        if d: out["Datum"] = d
-    if '._parse_time_loose' in dir():
-        t = _parse_time_loose(s)
-        if t: out["Uhrzeit"] = t
-    if "Uhrzeit" not in out:
-        m = re.search(r'(?<!\d)([01]?\d|2[0-3])[:.;h ]([0-5]\d)(?::([0-5]\d))?', s)
-        if m:
-            out["Uhrzeit"] = f"{int(m.group(1)):02d}:{m.group(2)}"
+    #if '._parse_date_loose' in dir():  # defensive, falls umbenannt
+    #    d = _parse_date_loose(s)
+    #    if d: out["Datum"] = d
+    #if '._parse_time_loose' in dir():
+    #    t = _parse_time_loose(s)
+    #    if t: out["Uhrzeit"] = t
+    #if "Uhrzeit" not in out:
+    #    m = re.search(r'(?<!\d)([01]?\d|2[0-3])[:.;h ]([0-5]\d)(?::([0-5]\d))?', s)
+    #    if m:
+    #        out["Uhrzeit"] = f"{int(m.group(1)):02d}:{m.group(2)}"
 
     # --- Laden (Marke/Ort) ---
     head = lines[:15]
