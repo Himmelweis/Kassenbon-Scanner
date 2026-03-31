@@ -3584,49 +3584,6 @@ def extract_data_fuel_pdf(text: str) -> dict:
 
     return out
 
-# ========= PDF: Text extrahieren (seitenweise) =========
-def extract_text_from_pdf(pdf_path: str) -> list[str]:
-    """
-    Liest Text aus einem PDF und liefert eine Liste von Strings – je Seite ein Eintrag.
-    Erwartet echten PDF-Text (Bilder/Logos werden ignoriert).
-    Falls pdfminer.six fehlt, kommt ein klarer Hinweis.
-    """
-    import re
-    pages: list[str] = []
-    try:
-        from pdfminer.high_level import extract_text
-    except Exception:
-        print("❗ Für PDF-Textextraktion bitte installieren: pip install pdfminer.six")
-        return pages
-
-    try:
-        raw = extract_text(pdf_path)  # enthält i. d. R. \f zwischen Seiten
-        if not raw:
-            return pages
-
-        for p in raw.split("\f"):
-            s = (p or "")
-            s = s.replace("\u00A0", " ")      # NBSP -> Space
-            s = s.replace("-\n", "")          # Silbentrennung am Zeilenende
-            s = s.replace("­\n", "").replace("­", "")  # weiches Trennzeichen
-            s = re.sub(r"[ \t]+", " ", s)
-            s = re.sub(r"\n{3,}", "\n\n", s).strip()
-
-            # optional: deine bestehende Normalisierung
-            if 'safe_post_ocr_cleanup' in globals():
-                try:
-                    s = safe_post_ocr_cleanup(s)
-                except Exception:
-                    pass
-
-            if s:
-                pages.append(s)
-    except Exception as e:
-        print(f"⚠️ PDF-Text konnte nicht extrahiert werden: {e}")
-
-    return pages
-
-
 # =================== Merge-Helfer ===================
 
 def _keep_nonempty(dst: dict, src: dict, keys: list[str]):
@@ -3850,6 +3807,257 @@ def detect_receipt_type(text: str, store_hint: str | None = None) -> str:
 
     return best
 
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    Liest Text direkt aus einer PDF. Liefert leeren String, wenn nichts Brauchbares drin ist.
+    """
+    text_parts = []
+
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            txt = page.get_text("text") or ""
+            if txt.strip():
+                text_parts.append(txt)
+        doc.close()
+    except Exception:
+        pass
+
+    text = "\n".join(text_parts).strip()
+    if len(text) < 40:
+        return ""
+
+    # Qualitätscheck: zu viele Ein-Zeichen-Zeilen -> unbrauchbarer Direkttext
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    short_lines = [ln for ln in lines if len(ln) <= 2]
+    ratio_short = len(short_lines) / max(1, len(lines))
+
+    # Wenn mehr als 60% der Zeilen nur 1-2 Zeichen haben: verwerfen
+    if ratio_short > 0.6:
+        return ""
+
+    # Wenn fast keine normalen Wörter vorkommen: verwerfen
+    long_word_lines = [ln for ln in lines if len(ln) >= 6 and any(c.isalpha() for c in ln)]
+    if len(long_word_lines) < 3:
+        return ""
+
+    return text
+
+def render_pdf_page_to_image(pdf_path: str, page_index: int = 0, zoom: float = 2.0) -> str | None:
+    """
+    Rendert die erste PDF-Seite als PNG und gibt den Bildpfad zurück.
+    """
+    try:
+        import fitz
+        import os
+
+        doc = fitz.open(pdf_path)
+        if page_index >= len(doc):
+            doc.close()
+            return None
+
+        page = doc[page_index]
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        out_path = os.path.splitext(pdf_path)[0] + f"__page{page_index+1}.png"
+        pix.save(out_path)
+        doc.close()
+        return out_path
+    except Exception as e:
+        print(f"⚠️ PDF-Render fehlgeschlagen: {e}")
+        return None
+
+
+def extract_data_from_text_only(raw_text: str) -> dict:
+    """
+    Einfacher, allgemeiner Textparser für direkt aus PDF gelesenen Text.
+    Kein Laden-Hardcoding nötig.
+    """
+    import re
+
+    out = {"Rohtext": raw_text}
+    txt = raw_text or ""
+    txt_up = txt.upper()
+
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+
+    # -------------------------
+    # Brand zuerst aus Gesamtdokument
+    # -------------------------
+    brand = None
+    brand_patterns = [
+        (r"\bKAUFLAND\b", "KAUFLAND"),
+        (r"\bLIDL\b", "LIDL"),
+        (r"\bALDI\b", "ALDI"),
+        (r"\bREWE\b", "REWE"),
+        (r"\bEDEKA\b", "EDEKA"),
+        (r"\bNETTO\b", "NETTO"),
+        (r"\bPENNY\b", "PENNY"),
+        (r"\bHAGEBAU\b", "hagebaumarkt"),
+        (r"\bBAUHAUS\b", "BAUHAUS"),
+        (r"\bOBI\b", "OBI"),
+        (r"\bHORNBACH\b", "HORNBACH"),
+        (r"\bAPOTHEKE\b", "APOTHEKE"),
+        (r"\bARAL\b", "ARAL"),
+        (r"\bSHELL\b", "SHELL"),
+        (r"\bJET\b", "JET"),
+        (r"\bESSO\b", "ESSO"),
+        (r"\bTOTAL\b", "TOTAL"),
+        (r"\bBFT\b", "bft"),
+    ]
+
+    for pat, label in brand_patterns:
+        if re.search(pat, txt_up):
+            brand = label
+            break
+
+    # -------------------------
+    # Adresse aus Kopf, Laden = Brand zuerst
+    # -------------------------
+    address = None
+
+    def _looks_like_address(s: str) -> bool:
+        s_up = s.upper()
+        if re.search(r"\b\d{5}\b", s_up):
+            return True
+        if re.search(r"\b(STRASSE|STRAßE|STR\.|WEG|PLATZ|ALLEE|HÖHE|HOEHE)\b", s_up):
+            return True
+        if re.search(r"\bTEL\b", s_up):
+            return True
+        return False
+
+    for ln in lines[:15]:
+        if _looks_like_address(ln):
+            address = ln
+            break
+
+    if brand:
+        out["Laden"] = brand
+    elif address:
+        out["Laden"] = address
+    if address:
+        out["Adresse"] = address
+
+    # -------------------------
+    # Datum / Uhrzeit
+    # -------------------------
+    m = re.search(r"(\d{2}\.\d{2}\.\d{2,4}).*?(\d{2}:\d{2})(?::\d{2})?", txt)
+    if m:
+        dd, mm, yy = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m.group(1)).groups()
+        if len(yy) == 2:
+            yy = "20" + yy
+        out["Datum"] = f"{yy}-{mm}-{dd}"
+        out["Uhrzeit"] = m.group(2)
+    else:
+        m_date = re.search(r"\b(\d{2}\.\d{2}\.\d{2,4})\b", txt)
+        m_time = re.search(r"\b(\d{2}:\d{2})(?::\d{2})?\b", txt)
+
+        if m_date:
+            dd, mm, yy = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m_date.group(1)).groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+            out["Datum"] = f"{yy}-{mm}-{dd}"
+
+        if m_time:
+            out["Uhrzeit"] = m_time.group(1)
+
+    # -------------------------
+    # Zahlung
+    # -------------------------
+    # "Pay" / Karte hat Vorrang vor Rückgeld
+    if re.search(r"\b(LIDL PAY|KAUFLAND PAY|BLUECODE|PAYBACK PAY|APPLE PAY|GOOGLE PAY)\b", txt_up):
+        out["Zahlung"] = "Karte"
+    elif re.search(r"\b(KARTE|EC|GIROCARD|VISA|MASTERCARD)\b", txt_up):
+        out["Zahlung"] = "Karte"
+    elif re.search(r"\b(BAR|BARZAHLUNG)\b", txt_up):
+        out["Zahlung"] = "Bar"
+    elif re.search(r"\b(RÜCKGELD|RUCKGELD)\b", txt_up):
+        # nur dann Bar annehmen, wenn NICHT gleichzeitig Pay/Karte vorkommt
+        out["Zahlung"] = "Bar"
+
+    # Falls sowohl Pay/Karte als auch Rückgeld vorkommen: Karte gewinnt
+    if re.search(r"\b(LIDL PAY|KAUFLAND PAY|BLUECODE|KARTE|EC|GIROCARD|VISA|MASTERCARD)\b", txt_up):
+        out["Zahlung"] = "Karte"
+
+    # -------------------------
+    # Betrag
+    # -------------------------
+    money_pat = r"(?<!\d)\d{1,4}[.,]\d{2}(?!\d)"
+
+    # bevorzugt Summe / zu zahlen / Pay-Zeile
+    m_total = re.search(
+        rf"(?is)(zu zahlen|endbetrag|summe|gesamt|betrag|lidl pay|kaufland pay)[^\d]{{0,40}}({money_pat})",
+        txt
+    )
+    if m_total:
+        try:
+            out["Betrag (€)"] = float(m_total.group(2).replace(",", "."))
+        except Exception:
+            pass
+
+    # -------------------------
+    # Belegtyp generisch
+    # -------------------------
+    # Fuel
+    if re.search(r"\b(DIESEL|SUPER E10|SUPER|KRAFTSTOFF|LITER|€/L|EUR/L)\b", txt_up):
+        out["Belegtyp"] = "fuel"
+
+    # Pharmacy
+    elif re.search(r"\b(APOTHEKE|PHARMA|REZEPT)\b", txt_up):
+        out["Belegtyp"] = "pharmacy"
+
+    # Grocery / Retail Heuristik:
+    # viele Artikelzeilen + Summe + Steuerblock
+    else:
+        article_like = 0
+        for ln in lines[:120]:
+            if re.search(rf"{money_pat}\s*[AB]?$", ln) or re.search(rf"\d+\s*\*\s*{money_pat}", ln):
+                article_like += 1
+
+        has_sum = bool(re.search(r"\b(SUMME|ZU ZAHLEN|BETRAG)\b", txt_up))
+        has_tax = bool(re.search(r"\b(STEUER|MWST|BRUTTO|NETTO)\b", txt_up))
+
+        if article_like >= 5 and has_sum:
+            out["Belegtyp"] = "grocery" if has_tax else "retail"
+        else:
+            out["Belegtyp"] = "generic"
+
+    return out
+
+def extract_data_from_pdf(pdf_path: str) -> dict | None:
+    """
+    PDF-Einstieg:
+    1) Erst versuchen, brauchbaren PDF-Text direkt zu lesen
+    2) Falls das nicht reicht: erste Seite rendern und mit PaddleOCR parsen
+    """
+    pdf_text = extract_text_from_pdf(pdf_path)
+
+    if pdf_text:
+        print("📄 PDF-Text direkt gelesen.")
+        return extract_data_from_text_only(pdf_text)
+
+    print("📄 PDF-Text unbrauchbar -> Render zu Bild + PaddleOCR")
+    image_path = render_pdf_page_to_image(pdf_path, page_index=0, zoom=2.0)
+    if not image_path:
+        return None
+
+    if USE_PADDLE:
+        lines = run_paddle_ocr(image_path)
+        result = parse_receipt_blocks(lines)
+        result["Rohtext"] = result.get("Rohtext") or ""
+        return result
+
+    # Fallback, falls Paddle aus ist
+    texts = ocr_text_multi(image_path)
+    if not texts:
+        return None
+    return extract_data_from_text_only("\n".join(texts))
+
 def extract_data_grocery(text: str) -> dict:
     import re
     data = {}
@@ -4070,80 +4278,95 @@ def scan_kassenbon(
         print(f"❗ Bild nicht gefunden: {image_path}")
         return None
 
-    # =========================
-    # OCR + Parsing
-    # =========================
-    if USE_PADDLE:
-        lines = run_paddle_ocr(image_path)
-        texts = [ln["text"] for ln in lines]
-        combined_text = "\n".join(texts)
-
-        best = parse_receipt_blocks(lines)
-
-        #print("\n=== DEBUG PADDLE RAW ===")
-        #print(best)
-
+    # PDF separat behandeln
+    if image_path.lower().endswith(".pdf"):
+        best = extract_data_from_pdf(image_path)
         if not best:
-            print("❗ PaddleOCR lieferte kein Ergebnis.")
+            print("❗ PDF konnte nicht verarbeitet werden.")
             return None
 
-        best["Rohtext"] = combined_text
-
-        # Belegtyp nur ergänzen, nicht überschreiben
-        if not best.get("Belegtyp"):
-            txt_up = combined_text.upper()
-
-            if re.search(r"\b(HAGEBAU|OBI|BAUHAUS|HORNBACH)\b", txt_up):
-                best["Belegtyp"] = "retail"
-            elif re.search(r"\b(BÄCKEREI|BACKHAUS|BACKSTUBE|KONDITOREI)\b", txt_up):
-                best["Belegtyp"] = "retail"
-            elif re.search(r"\b(LIDL|ALDI|EDEKA|REWE|NORMA|NETTO|PENNY|KAUFLAND)\b", txt_up):
-                best["Belegtyp"] = "grocery"
-            elif re.search(r"\b(APOTHEKE)\b", txt_up):
-                best["Belegtyp"] = "pharmacy"
-            elif re.search(r"\b(ARAL|SHELL|JET|ESSO|TOTAL|BFT)\b", txt_up):
-                best["Belegtyp"] = "fuel"
-            else:
-                best["Belegtyp"] = "generic"
-
+        # Mindestkompatibilität für den Rest
+        texts = [best.get("Rohtext", "")]
+        combined_text = best.get("Rohtext", "")
         rtype = best.get("Belegtyp", "generic")
 
+        print("\n=== DEBUG PDF RAW ===")
+        print(best)
     else:
-        texts = ocr_text_multi(image_path)
+        # =========================
+        # OCR + Parsing
+        # =========================
+        if USE_PADDLE:
+            lines = run_paddle_ocr(image_path)
+            texts = [ln["text"] for ln in lines]
+            combined_text = "\n".join(texts)
+
+            best = parse_receipt_blocks(lines)
+
+            #print("\n=== DEBUG PADDLE RAW ===")
+            #print(best)
+
+            if not best:
+                print("❗ PaddleOCR lieferte kein Ergebnis.")
+                return None
+
+            best["Rohtext"] = combined_text
+
+            # Belegtyp nur ergänzen, nicht überschreiben
+            if not best.get("Belegtyp"):
+                txt_up = combined_text.upper()
+
+                if re.search(r"\b(HAGEBAU|OBI|BAUHAUS|HORNBACH)\b", txt_up):
+                    best["Belegtyp"] = "retail"
+                elif re.search(r"\b(BÄCKEREI|BACKHAUS|BACKSTUBE|KONDITOREI)\b", txt_up):
+                    best["Belegtyp"] = "retail"
+                elif re.search(r"\b(LIDL|ALDI|EDEKA|REWE|NORMA|NETTO|PENNY|KAUFLAND)\b", txt_up):
+                    best["Belegtyp"] = "grocery"
+                elif re.search(r"\b(APOTHEKE)\b", txt_up):
+                    best["Belegtyp"] = "pharmacy"
+                elif re.search(r"\b(ARAL|SHELL|JET|ESSO|TOTAL|BFT)\b", txt_up):
+                    best["Belegtyp"] = "fuel"
+                else:
+                    best["Belegtyp"] = "generic"
+
+            rtype = best.get("Belegtyp", "generic")
+
+        else:
+            texts = ocr_text_multi(image_path)
+            if not texts:
+                print("❗ Keine OCR-Texte erhalten.")
+                return None
+
+            combined_text = "\n".join(texts)
+
+            parsed = []
+            for tx in texts:
+                try:
+                    parsed.append(extract_data_from_text(tx) | {"Rohtext": tx})
+                except Exception:
+                    parsed.append({"Rohtext": tx})
+
+            rtype = detect_receipt_type(combined_text) if 'detect_receipt_type' in globals() else "generic"
+            best = merge_variant_dicts(parsed, receipt_type=rtype)
+
+            # Nur im Tesseract-Zweig alte Fallbacks
+            if not best.get("Betrag (€)"):
+                tot = _pick_total_candidate(combined_text)
+                if tot is not None:
+                    best["Betrag (€)"] = tot
+
+            if not best.get("Laden"):
+                store_guess = _guess_store_name(combined_text)
+                if store_guess:
+                    best["Laden"] = store_guess
+
+            pay = majority_payment(texts)
+            if pay and (not best.get("Zahlung") or best["Zahlung"] in ("Unbekannt", "")):
+                best["Zahlung"] = pay
+
         if not texts:
             print("❗ Keine OCR-Texte erhalten.")
             return None
-
-        combined_text = "\n".join(texts)
-
-        parsed = []
-        for tx in texts:
-            try:
-                parsed.append(extract_data_from_text(tx) | {"Rohtext": tx})
-            except Exception:
-                parsed.append({"Rohtext": tx})
-
-        rtype = detect_receipt_type(combined_text) if 'detect_receipt_type' in globals() else "generic"
-        best = merge_variant_dicts(parsed, receipt_type=rtype)
-
-        # Nur im Tesseract-Zweig alte Fallbacks
-        if not best.get("Betrag (€)"):
-            tot = _pick_total_candidate(combined_text)
-            if tot is not None:
-                best["Betrag (€)"] = tot
-
-        if not best.get("Laden"):
-            store_guess = _guess_store_name(combined_text)
-            if store_guess:
-                best["Laden"] = store_guess
-
-        pay = majority_payment(texts)
-        if pay and (not best.get("Zahlung") or best["Zahlung"] in ("Unbekannt", "")):
-            best["Zahlung"] = pay
-
-    if not texts:
-        print("❗ Keine OCR-Texte erhalten.")
-        return None
 
     # =========================
     # Gemeinsame Nachbearbeitung
@@ -4681,14 +4904,14 @@ def scan_pdf_receipt(
         return None
 
     try:
-        # 1) OCR/Extraktion der PDF-Seiten
-        pages_texts = extract_text_from_pdf(pdf_path)
-        if not pages_texts:
-            print("❗ Kein Text aus PDF erhalten.")
+        # 1) PDF-Text direkt lesen
+        pdf_text = extract_text_from_pdf(pdf_path)
+        if not pdf_text:
+            print("❗ Kein brauchbarer Text aus PDF erhalten.")
             return None
 
-        # 2) Alles kombinieren
-        combined_text = "\n".join(pages_texts)
+        # 2) Direkt verwenden
+        combined_text = pdf_text
 
         # 3) Debug-Ausgaben (analog zu scan_kassenbon)
         if show_debug_footer or debug_print:
@@ -4697,11 +4920,35 @@ def scan_pdf_receipt(
             print("\n--- CLEAN (letzte 25 Zeilen, PDF) ---")
             print("\n".join(combined_text.splitlines()[-25:]))
 
-        # 4) Typ auf fuel setzen
-        rtype = "fuel"
+        # 4) PDF direkt mit dem allgemeinen Textparser verarbeiten
+        best = extract_data_from_text_only(combined_text) or {}
+        best["Rohtext"] = combined_text
 
-        # 5) PDF-spezifisches Parsing
-        best = extract_data_fuel_pdf(combined_text)
+        txt_up = combined_text.upper()
+
+        # Typ nur noch leicht nachschärfen, nicht hart den Laden setzen
+        if any(x in txt_up for x in ["ARAL", "SHELL", "JET", "ESSO", "TOTAL", "BFT"]):
+            best.setdefault("Belegtyp", "fuel")
+        else:
+            best.setdefault("Belegtyp", "generic")
+        rtype = best.get("Belegtyp", "generic")
+
+        # Wenn im ganzen PDF klar eine Marke vorkommt, aber der Laden wie eine Adresse aussieht:
+        if best.get("Laden"):
+            cur_store = best["Laden"].upper()
+
+            looks_bad_store = (
+                re.search(r"\b\d{5}\b", cur_store) is not None or
+                re.search(r"\b(STRASSE|STRAßE|STR\.|WEG|PLATZ|ALLEE|HÖHE|HOEHE)\b", cur_store) is not None or
+                re.fullmatch(r"DE\d{6,}", cur_store) is not None or
+                re.fullmatch(r"[\d\s\-./]+", cur_store) is not None
+            )
+
+            if looks_bad_store:
+                for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
+                    if brand in txt_up:
+                        best["Laden"] = brand
+                        break
 
         # 6) Prüfstatus
         def _status_from(d: dict) -> str:
@@ -4746,8 +4993,8 @@ def scan_pdf_receipt(
         try:
             reviewed.setdefault("Belegtyp", rtype)
             print("\n=== DEBUG VOR EXCEL 4 ===")
-            print(best)
-            append_to_excel_typed(reviewed, rtype, excel_path=excel_path)
+            print(reviewed)
+            append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
             print(f"✅ Gespeichert nach: {excel_path}")
         except Exception as e:
             print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
