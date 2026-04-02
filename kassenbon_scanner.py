@@ -2577,11 +2577,11 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
     for i, ln in enumerate(lines):
         txt = _txt(ln).lower()
 
-        # Karte hat Vorrang
-        if _has_card_hint(txt):
-            payment = "Karte"
+        # Explizite Bar-Zeilen zuerst
+        if txt == "bar" or "barzahlung" in txt:
+            payment = "Bar"
 
-        # Rückgeld -> Bar
+        # Rückgeld -> sicher Bar
         if any(k in txt for k in ["ruckgeld", "rückgeld", "zuruck", "zurück"]):
             payment = "Bar"
             nearby = _find_money_near(i, window_before=3, window_after=1, allow_negative=True)
@@ -2589,8 +2589,12 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
             if negs:
                 change_amount = negs[-1][1]
 
-        # Gegeben nur dann als Bar interpretieren, wenn in derselben Zeile kein Kartenhinweis steht
-        if ("gegeben" in txt or txt == "bar" or "barzahlung" in txt) and not _has_card_hint(txt):
+        # Karte nur dann, wenn nicht schon Bar sicher erkannt wurde
+        if payment != "Bar" and _has_card_hint(txt):
+            payment = "Karte"
+
+        # "gegeben" nur dann als Bar interpretieren, wenn kein Kartenhinweis in derselben Zeile steht
+        if ("gegeben" in txt) and not _has_card_hint(txt):
             payment = "Bar"
             nearby = _find_money_near(i, window_before=1, window_after=3, allow_negative=False)
             pos = [x for x in nearby if x[2] > 0]
@@ -3896,7 +3900,6 @@ def extract_data_from_text_only(raw_text: str) -> dict:
         (r"\bALDI\b", "ALDI"),
         (r"\bREWE\b", "REWE"),
         (r"\bEDEKA\b", "EDEKA"),
-        (r"\bNETTO\b", "NETTO"),
         (r"\bPENNY\b", "PENNY"),
         (r"\bHAGEBAU\b", "hagebaumarkt"),
         (r"\bBAUHAUS\b", "BAUHAUS"),
@@ -3967,6 +3970,57 @@ def extract_data_from_text_only(raw_text: str) -> dict:
             out["Uhrzeit"] = m_time.group(1)
 
     # -------------------------
+    # Fuel-/Rechnungs-spezifische Erkennung
+    # -------------------------
+    is_fuel_like = False
+    if re.search(r"\b(TANKRECHNUNG|TANKSTELLE|SUPER|DIESEL|EUR/L|LITER|KRAFTSTOFF)\b", txt_up):
+        is_fuel_like = True
+
+    if is_fuel_like:
+        out["Belegtyp"] = "fuel"
+
+        # Laden
+        m_store = re.search(r"(ZG\s+TANKSTELLE[^\n\r]*)", txt, flags=re.I)
+        if m_store:
+            out["Laden"] = m_store.group(1).strip()
+        elif re.search(r"HONECK-WALDSCHÜTZ ENERGIE", txt_up):
+            out["Laden"] = "Honeck-Waldschütz Energie GmbH"
+
+        # Kraftstoffart
+        if re.search(r"\bSUPER(\s*E10|\s*E5| BLFR\.)?\b", txt_up):
+            out["Kraftstoffart"] = "Super"
+        elif re.search(r"\bDIESEL\b", txt_up):
+            out["Kraftstoffart"] = "Diesel"
+
+        # Datum / Uhrzeit aus Tankzeile bevorzugen
+        m_dt = re.search(r"(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})", txt)
+        if m_dt:
+            dd, mm, yy = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m_dt.group(1)).groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+            out["Datum"] = f"{yy}-{mm}-{dd}"
+            out["Uhrzeit"] = m_dt.group(2)
+
+        # Zahlung
+        if re.search(r"\bABGEBUCHT\b", txt_up) or re.search(r"\bIBAN\b", txt_up):
+            out["Zahlung"] = "Lastschrift"
+
+        # Betrag: Endbetrag / Bruttobetrag bevorzugen
+        m_end = re.search(r"(?is)(ENDBETRAG|BRUTTOBETRAG)[^\d]{0,40}(\d{1,4}[.,]\d{2})", txt)
+        if m_end:
+            try:
+                out["Betrag (€)"] = float(m_end.group(2).replace(",", "."))
+            except Exception:
+                pass
+        else:
+            m_sum = re.search(r"(?is)\bSUMME\b[^\d]{0,40}(\d{1,4}[.,]\d{2})", txt)
+            if m_sum:
+                try:
+                    out["Betrag (€)"] = float(m_sum.group(1).replace(",", "."))
+                except Exception:
+                    pass
+
+    # -------------------------
     # Zahlung
     # -------------------------
     # "Pay" / Karte hat Vorrang vor Rückgeld
@@ -4003,31 +4057,38 @@ def extract_data_from_text_only(raw_text: str) -> dict:
     # -------------------------
     # Belegtyp generisch
     # -------------------------
-    # Fuel
-    if re.search(r"\b(DIESEL|SUPER E10|SUPER|KRAFTSTOFF|LITER|€/L|EUR/L)\b", txt_up):
-        out["Belegtyp"] = "fuel"
+    fuel_hits = 0
+    if re.search(r"\bDIESEL\b", txt_up):
+        fuel_hits += 1
+    if re.search(r"\bSUPER(\s*E10|\s*E5)?\b", txt_up):
+        fuel_hits += 1
+    if re.search(r"\bKRAFTSTOFF\b", txt_up):
+        fuel_hits += 1
+    if re.search(r"(€/L|EUR/L|LITER)", txt_up):
+        fuel_hits += 1
+    if re.search(r"\bZAPFSÄULE\b|\bSAULENNUMMER\b|\bSÄULE\b", txt_up):
+        fuel_hits += 1
+    if re.search(r"\bTANK(RECHNUNG|STELLE|DATEN)?\b", txt_up):
+        fuel_hits += 1
 
-    # Pharmacy
+    if fuel_hits >= 2:
+        out["Belegtyp"] = "fuel"
     elif re.search(r"\b(APOTHEKE|PHARMA|REZEPT)\b", txt_up):
         out["Belegtyp"] = "pharmacy"
-
-    # Grocery / Retail Heuristik:
-    # viele Artikelzeilen + Summe + Steuerblock
     else:
         article_like = 0
+        money_pat = r"(?<!\d)\d{1,4}[.,]\d{2}(?!\d)"
         for ln in lines[:120]:
             if re.search(rf"{money_pat}\s*[AB]?$", ln) or re.search(rf"\d+\s*\*\s*{money_pat}", ln):
                 article_like += 1
 
-        has_sum = bool(re.search(r"\b(SUMME|ZU ZAHLEN|BETRAG)\b", txt_up))
+        has_sum = bool(re.search(r"\b(SUMME|ZU ZAHLEN|BETRAG|TOTAL)\b", txt_up))
         has_tax = bool(re.search(r"\b(STEUER|MWST|BRUTTO|NETTO)\b", txt_up))
 
         if article_like >= 5 and has_sum:
             out["Belegtyp"] = "grocery" if has_tax else "retail"
         else:
             out["Belegtyp"] = "generic"
-
-    return out
 
 def extract_data_from_pdf(pdf_path: str) -> dict | None:
     """
@@ -4262,6 +4323,86 @@ def extract_data_grocery(text: str) -> dict:
         if isinstance(val, (int,float)):
             data["Wechselgeld (€)"] = val
 
+def extract_fuel_details_from_text(raw_text: str) -> dict:
+    """
+    Extrahiert nur tankstellen-spezifische Zusatzfelder.
+    Basisdaten wie Laden, Datum, Uhrzeit, Betrag, Zahlung kommen aus dem allgemeinen Parser.
+    """
+    import re
+
+    out = {}
+    txt = raw_text or ""
+    txt_up = txt.upper()
+
+    # Kraftstoffart
+    fuel_patterns = [
+        (r"\bSUPER\s*E10\b", "Super E10"),
+        (r"\bSUPER\b", "Super"),
+        (r"\bDIESEL\b", "Diesel"),
+        (r"\bULTIMATE\s*102\b", "Ultimate 102"),
+        (r"\bULTIMATE\s*DIESEL\b", "Ultimate Diesel"),
+        (r"\bV-?POWER\s*DIESEL\b", "V-Power Diesel"),
+        (r"\bV-?POWER\b", "V-Power"),
+    ]
+    for pat, label in fuel_patterns:
+        if re.search(pat, txt_up):
+            out["Kraftstoffart"] = label
+            break
+
+    # Liter
+    m_liters = re.search(r"\b(\d{1,3}[.,]\d{2,3})\s*(L|LTR|LITER)\b", txt_up)
+    if m_liters:
+        try:
+            out["Liter"] = float(m_liters.group(1).replace(",", "."))
+        except Exception:
+            pass
+
+    # Preis pro Liter
+    m_price_per_l = re.search(r"\b(\d[.,]\d{3})\s*(EUR/L|€/L|E/L)\b", txt_up)
+    if m_price_per_l:
+        try:
+            out["Preis/L"] = float(m_price_per_l.group(1).replace(",", "."))
+        except Exception:
+            pass
+
+    # Fallback: Betrag ≈ Liter * Preis/L plausibilisieren nur, nicht überschreiben
+    if "Liter" in out and "Preis/L" in out:
+        try:
+            out["Tankbetrag_calc"] = round(out["Liter"] * out["Preis/L"], 2)
+        except Exception:
+            pass
+
+    return out
+
+def refine_receipt_type_from_text(raw_text: str, current_type: str = "generic") -> str:
+    """
+    Schärft den Belegtyp anhand klarer Textmuster nach.
+    Fuel hat Vorrang, wenn mehrere starke Hinweise vorkommen.
+    """
+    import re
+
+    txt = (raw_text or "").upper()
+    fuel_hits = 0
+
+    if re.search(r"\bDIESEL\b", txt):
+        fuel_hits += 1
+    if re.search(r"\bSUPER(\s*E10|\s*E5)?\b", txt):
+        fuel_hits += 1
+    if re.search(r"(€/L|EUR/L|LITER)", txt):
+        fuel_hits += 1
+    if re.search(r"\b(TANKRECHNUNG|TANKSTELLE|KRAFTSTOFF)\b", txt):
+        fuel_hits += 1
+    if re.search(r"\b(SÄULE|SAULENNUMMER|ZAPFSÄULE)\b", txt):
+        fuel_hits += 1
+
+    if fuel_hits >= 2:
+        return "fuel"
+
+    if re.search(r"\b(APOTHEKE|PHARMA|REZEPT)\b", txt):
+        return "pharmacy"
+
+    return current_type or "generic"
+
 def scan_kassenbon(
     image_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -4405,8 +4546,25 @@ def scan_kassenbon(
     if best.get("Betrag (€)"):
         best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
 
+    # Typ nach Rohtext nachschärfen
+    best["Belegtyp"] = refine_receipt_type_from_text(
+        best.get("Rohtext", ""),
+        best.get("Belegtyp", "generic")
+    )
+
     print("\n=== DEBUG VOR STATUS ===")
     print(best)
+
+    # Fuel-Spezialfelder nur ergänzen, nicht Basisdaten überschreiben
+    if best.get("Belegtyp") == "fuel":
+        try:
+            fuel_spec = extract_fuel_details_from_text(best.get("Rohtext", "")) or {}
+            for k, v in fuel_spec.items():
+                if v not in (None, "", 0):
+                    if k not in best or best.get(k) in (None, "", 0):
+                        best[k] = v
+        except Exception as e:
+            print(f"⚠️ Fuel-Spezialparser fehlgeschlagen: {e}")
 
     # =========================
     # Prüfstatus
@@ -4920,17 +5078,77 @@ def scan_pdf_receipt(
             print("\n--- CLEAN (letzte 25 Zeilen, PDF) ---")
             print("\n".join(combined_text.splitlines()[-25:]))
 
-        # 4) PDF direkt mit dem allgemeinen Textparser verarbeiten
-        best = extract_data_from_text_only(combined_text) or {}
-        best["Rohtext"] = combined_text
+        import re
 
         txt_up = combined_text.upper()
+        best = {"Rohtext": combined_text}
 
-        # Typ nur noch leicht nachschärfen, nicht hart den Laden setzen
-        if any(x in txt_up for x in ["ARAL", "SHELL", "JET", "ESSO", "TOTAL", "BFT"]):
-            best.setdefault("Belegtyp", "fuel")
+        # PDF direkt mit dem allgemeinen Textparser versuchen
+        base = extract_data_from_text_only(combined_text) or {}
+        best.update(base)
+
+        # Fuel-Rechnung gezielt nachschärfen
+        if re.search(r"\b(TANKRECHNUNG|TANKSTELLE|SUPER|DIESEL|EUR/L|LITER|KRAFTSTOFF)\b", txt_up):
+            best["Belegtyp"] = "fuel"
+
+            # Laden
+            m_store = re.search(r"(ZG\s+TANKSTELLE[^\n\r]*)", combined_text, flags=re.I)
+            if m_store:
+                best["Laden"] = m_store.group(1).strip()
+            elif re.search(r"HONECK-WALDSCHÜTZ ENERGIE", txt_up):
+                best["Laden"] = "Honeck-Waldschütz Energie GmbH"
+
+            # Datum / Uhrzeit
+            m_dt = re.search(r"(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})", combined_text)
+            if m_dt:
+                m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m_dt.group(1))
+                if m_date:
+                    dd, mm, yy = m_date.groups()
+                    if len(yy) == 2:
+                        yy = "20" + yy
+                    best["Datum"] = f"{yy}-{mm}-{dd}"
+                    best["Uhrzeit"] = m_dt.group(2)
+
+            # Kraftstoffart
+            if re.search(r"\bSUPER(\s*E10|\s*E5| BLFR\.)?\b", txt_up):
+                best["Kraftstoffart"] = "Super"
+            elif re.search(r"\bDIESEL\b", txt_up):
+                best["Kraftstoffart"] = "Diesel"
+
+            # Zahlung
+            if re.search(r"\bABGEBUCHT\b", txt_up) or re.search(r"\bIBAN\b", txt_up):
+                best["Zahlung"] = "Lastschrift"
+
+            # Betrag: Endbetrag / Bruttobetrag bevorzugen
+            # Betrag: Endbetrag / Bruttobetrag bevorzugen
+            amount_candidates = []
+
+            # 1) Endbetrag
+            for m in re.finditer(r"(?is)(\d{1,4}[.,]\d{2})\s*\*?\s*ENDBETRAG", combined_text):
+                amount_candidates.append(m.group(1))
+            for m in re.finditer(r"(?is)ENDBETRAG[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
+                amount_candidates.append(m.group(1))
+
+            # 2) Bruttobetrag
+            for m in re.finditer(r"(?is)BRUTTOBETRAG[^\d]{0,60}(\d{1,4}[.,]\d{2})", combined_text):
+                amount_candidates.append(m.group(1))
+
+            # 3) Fallback: Summe
+            for m in re.finditer(r"(?is)\bSUMME\b[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
+                amount_candidates.append(m.group(1))
+
+            if amount_candidates:
+                try:
+                    vals = [float(x.replace(",", ".")) for x in amount_candidates]
+                    best["Betrag (€)"] = max(vals)
+                except Exception:
+                    pass
+
+            rtype = "fuel"
+
         else:
-            best.setdefault("Belegtyp", "generic")
+            rtype = best.get("Belegtyp", "generic")
+
         rtype = best.get("Belegtyp", "generic")
 
         # Wenn im ganzen PDF klar eine Marke vorkommt, aber der Laden wie eine Adresse aussieht:
@@ -4949,6 +5167,15 @@ def scan_pdf_receipt(
                     if brand in txt_up:
                         best["Laden"] = brand
                         break
+        if best.get("Belegtyp") == "fuel":
+            try:
+                fuel_spec = extract_fuel_details_from_text(best.get("Rohtext", "")) or {}
+                for k, v in fuel_spec.items():
+                    if v not in (None, "", 0):
+                        if k not in best or best.get(k) in (None, "", 0):
+                            best[k] = v
+            except Exception as e:
+                print(f"⚠️ Fuel-Spezialparser (PDF) fehlgeschlagen: {e}")
 
         # 6) Prüfstatus
         def _status_from(d: dict) -> str:
@@ -4970,6 +5197,13 @@ def scan_pdf_receipt(
                 return "Prüfen: Zahlung fehlt"
 
             return "OK"
+
+        # Typ nach Rohtext nachschärfen
+        best["Belegtyp"] = refine_receipt_type_from_text(
+            best.get("Rohtext", ""),
+            best.get("Belegtyp", "generic")
+        )
+        rtype = best.get("Belegtyp", rtype)
 
         print("\n=== DEBUG VOR STATUS 5 ===")
         print(best)
