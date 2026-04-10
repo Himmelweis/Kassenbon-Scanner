@@ -10,11 +10,18 @@ Created on Sun Aug 31 19:14:15 2025
 # kassenbon_scanner.py
 # Foto -> OCR (mehrere Varianten) -> Parsing -> Merge -> Excel
 # kassenbon_scanner.py
-import os, re, cv2, pytesseract, pandas as pd, numpy as np
+import os
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+import torch
+import  re, cv2, pytesseract, pandas as pd, numpy as np
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 from datetime import datetime
 from PIL import Image
 import re
 from pathlib import Path
+
+from paddle.device.cuda.cuda_graphed_layer import debug_print
 from paddleocr import PaddleOCR
 # ========= Debug Switches (standard: aus) =========
 
@@ -4403,12 +4410,32 @@ def refine_receipt_type_from_text(raw_text: str, current_type: str = "generic") 
 
     return current_type or "generic"
 
+def _status_from(d: dict) -> str:
+    betrag = d.get("Betrag (€)")
+    laden = d.get("Laden")
+    zahl = d.get("Zahlung")
+    rtype = d.get("Belegtyp")
+
+    if betrag in (None, "", 0, 0.0):
+        return "Prüfen: Betrag fehlt/unsicher"
+
+    if not laden or len(str(laden).strip()) < 4:
+        return "Prüfen: Laden unsicher"
+
+    if not rtype or rtype == "generic":
+        return "Prüfen: Typ unsicher"
+
+    if not zahl:
+        return "Prüfen: Zahlung fehlt"
+
+    return "OK"
+
 def scan_kassenbon(
     image_path: str,
     excel_path: str = "kassenbons.xlsx",
     review_when: str = "prüfen",
     strict_total: bool = True,
-    show_debug_footer: bool = True
+    show_debug_footer: bool = False
 ):
     import os
     import re
@@ -4431,8 +4458,8 @@ def scan_kassenbon(
         combined_text = best.get("Rohtext", "")
         rtype = best.get("Belegtyp", "generic")
 
-        print("\n=== DEBUG PDF RAW ===")
-        print(best)
+        #print("\n=== DEBUG PDF RAW ===")
+        #print(best)
     else:
         # =========================
         # OCR + Parsing
@@ -4515,7 +4542,7 @@ def scan_kassenbon(
     combo_raw = "\n".join(texts)
     combo_text = safe_post_ocr_cleanup(combo_raw)
 
-    if show_debug_footer:
+    if show_debug_footer or debug_print:
         print("\n--- CLEAN HEAD ---")
         for ln in combo_text.splitlines()[:20]:
             print(ln)
@@ -4552,8 +4579,8 @@ def scan_kassenbon(
         best.get("Belegtyp", "generic")
     )
 
-    print("\n=== DEBUG VOR STATUS ===")
-    print(best)
+    #print("\n=== DEBUG VOR STATUS ===")
+    #print(best)
 
     # Fuel-Spezialfelder nur ergänzen, nicht Basisdaten überschreiben
     if best.get("Belegtyp") == "fuel":
@@ -4566,28 +4593,6 @@ def scan_kassenbon(
         except Exception as e:
             print(f"⚠️ Fuel-Spezialparser fehlgeschlagen: {e}")
 
-    # =========================
-    # Prüfstatus
-    # =========================
-    def _status_from(d: dict) -> str:
-        betrag = d.get("Betrag (€)")
-        laden = d.get("Laden")
-        zahl = d.get("Zahlung")
-        typ = d.get("Belegtyp")
-
-        if betrag in (None, "", 0, 0.0):
-            return "Prüfen: Betrag fehlt/unsicher"
-
-        if not laden or len(str(laden).strip()) < 4:
-            return "Prüfen: Laden unsicher"
-
-        if not typ or typ == "generic":
-            return "Prüfen: Typ unsicher"
-
-        if not zahl:
-            return "Prüfen: Zahlung fehlt"
-
-        return "OK"
 
     pruefstatus = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
@@ -4595,18 +4600,19 @@ def scan_kassenbon(
     # =========================
     # Optionaler Review-Dialog
     # =========================
-    reviewed = best
-    if 'review_and_correct' in globals():
-        want_review = (
-            review_when.lower() == "immer" or
-            (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
-        )
-        if want_review:
-            try:
-                reviewed = review_and_correct(best) or best
-            except Exception as e:
-                print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
+    #reviewed = best
+    #if 'review_and_correct' in globals():
+    #    want_review = (
+    #        review_when.lower() == "immer" or
+    #        (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
+    #    )
+    #    if want_review:
+    #try:
+    #    reviewed = review_and_correct(best) or best
+    #except Exception as e:
+    #    print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
+    reviewed = best
     # Werte noch einmal säubern
     try:
         reviewed = _sanitize_dict_values(reviewed)
@@ -4616,8 +4622,8 @@ def scan_kassenbon(
     # Wenn Review den Typ nicht setzt, den erkannten Typ verwenden
     reviewed.setdefault("Belegtyp", rtype)
 
-    print("\n=== DEBUG VOR EXCEL ===")
-    print(reviewed)
+    #print("\n=== DEBUG VOR EXCEL ===")
+    #print(reviewed)
 
     # =========================
     # Excel schreiben
@@ -4666,14 +4672,14 @@ def scan_kassenbon_group(
     # 2) COMBO (wie bei single)
     combo_raw  = "\n".join(texts)
     combo_text = safe_post_ocr_cleanup(combo_raw)
-    print("\n--- CLEAN HEAD (for store) ---")
-    for ln in [l for l in combo_text.splitlines() if l.strip()][:12]:
-        print(ln)
-    cand_store = _guess_store_name_head(combo_text)
-    print(f"STORE-CANDIDATE: {cand_store!r}")
+    #print("\n--- CLEAN HEAD (for store) ---")
+    #for ln in [l for l in combo_text.splitlines() if l.strip()][:12]:
+    #    print(ln)
+    #cand_store = _guess_store_name_head(combo_text)
+    #print(f"STORE-CANDIDATE: {cand_store!r}")
 
 
-    if show_debug_footer:
+    if show_debug_footer or debug_print:
         print("\n--- CLEAN (letzte 25 Zeilen, multi) ---")
         for ln in combo_text.splitlines()[-25:]:
             print(ln)
@@ -4769,27 +4775,6 @@ def scan_kassenbon_group(
 
     apply_payment_detection(best, combo_text, debug=True)
 
-    # 5) Prüfstatus
-    def _status_from(d: dict) -> str:
-        betrag = d.get("Betrag (€)")
-        laden = d.get("Laden")
-        zahl = d.get("Zahlung")
-        rtype = d.get("Belegtyp")
-
-        if betrag in (None, "", 0, 0.0):
-            return "Prüfen: Betrag fehlt/unsicher"
-
-        if not laden or len(str(laden).strip()) < 4:
-            return "Prüfen: Laden unsicher"
-
-        if not rtype or rtype == "generic":
-            return "Prüfen: Typ unsicher"
-
-        if not zahl:
-            return "Prüfen: Zahlung fehlt"
-
-        return "OK"
-
     #print("\n=== DEBUG VOR STATUS 3 ===")
     #print(best)
     status = _status_from(best)
@@ -4797,36 +4782,16 @@ def scan_kassenbon_group(
 
     # 6) Optionaler Review
     reviewed = best
-    if ('review_and_correct' in globals()):
-        want_review = (
-            review_when.lower() == "immer" or
-            (review_when.lower().startswith("prüf") and not status.upper().startswith("OK"))
-        )
-        if want_review:
-            try:
-                reviewed = review_and_correct(best) or best
-            except Exception as e:
-                print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
-
-    def _status_from(d: dict) -> str:
-        betrag = d.get("Betrag (€)")
-        laden = d.get("Laden")
-        zahl = d.get("Zahlung")
-        rtype = d.get("Belegtyp")
-
-        if betrag in (None, "", 0, 0.0):
-            return "Prüfen: Betrag fehlt/unsicher"
-
-        if not laden or len(str(laden).strip()) < 4:
-            return "Prüfen: Laden unsicher"
-
-        if not rtype or rtype == "generic":
-            return "Prüfen: Typ unsicher"
-
-        if not zahl:
-            return "Prüfen: Zahlung fehlt"
-
-        return "OK"
+    #if ('review_and_correct' in globals()):
+    #    want_review = (
+    #        review_when.lower() == "immer" or
+    #        (review_when.lower().startswith("prüf") and not status.upper().startswith("OK"))
+    #    )
+    #    if want_review:
+    #        try:
+    #            reviewed = review_and_correct(best) or best
+    #        except Exception as e:
+    #            print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
     # 7) Excel
     #try:
@@ -4849,8 +4814,8 @@ def scan_kassenbon_group(
 
     # --- Excel nur HIER (einmal) schreiben ---
     try:
-        print("\n=== DEBUG VOR EXCEL 2 ===")
-        print(best)
+        #print("\n=== DEBUG VOR EXCEL 2 ===")
+        #print(best)
         append_to_excel_typed(best, rtype, excel_path=excel_path)
         print(f"✅ Gespeichert nach: {excel_path}")
     except Exception as e:
@@ -4866,12 +4831,12 @@ def batch_scan(folder: str, excel_path=EXCEL_PATH, review_when="prüfen"):
         res = scan_kassenbon(f, excel_path=excel_path)  # mit GUI
         # falls du ohne GUI willst: baue scan_* leicht um oder setze einen Flag
         # wenn Prüfstatus == 'prüfen': erneut mit Review öffnen:
-        if res and res.get("Prüfstatus") == review_when:
-            res2 = review_and_correct(res, res.get("Rohtext",""))
-            if res2:
-                print("\n=== DEBUG VOR EXCEL 3 ===")
-                print(best)
-                append_to_excel(res2, excel_path=excel_path)
+        #if res and res.get("Prüfstatus") == review_when:
+        #    res2 = review_and_correct(res, res.get("Rohtext",""))
+        #    if res2:
+        #        #print("\n=== DEBUG VOR EXCEL 3 ===")
+        #        #print(best)
+        #        append_to_excel(res2, excel_path=excel_path)
 
 # =================== Batch-Scan (kompletter Block) ===================
 
@@ -5146,6 +5111,49 @@ def scan_pdf_receipt(
 
             rtype = "fuel"
 
+        elif re.search(r"\b(KAUFLAND|LIDL|ALDI|REWE|EDEKA|NETTO|PENNY)\b", txt_up):
+            # Grocery-/Retail-PDF gezielt nachschärfen
+            best["Belegtyp"] = "grocery"
+
+            # Laden
+            for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
+                if brand in txt_up:
+                    best["Laden"] = brand
+                    break
+
+            # Datum / Uhrzeit
+            m_dt = re.search(r"(\d{2}[.,]\d{2}[.,]\d{2,4}).*?(\d{2}:\d{2})(?::\d{2})?", combined_text)
+            if m_dt:
+                raw_date = m_dt.group(1).replace(",", ".")
+                m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
+                if m_date:
+                    dd, mm, yy = m_date.groups()
+                    if len(yy) == 2:
+                        yy = "20" + yy
+                    best["Datum"] = f"{yy}-{mm}-{dd}"
+                best["Uhrzeit"] = m_dt.group(2)
+
+            # Zahlung
+            if re.search(r"\b(LIDL PAY|KAUFLAND PAY|BLUECODE|EC|GIROCARD|VISA|MASTERCARD|KARTE)\b", txt_up):
+                best["Zahlung"] = "Karte"
+            elif re.search(r"\bBAR\b", txt_up):
+                best["Zahlung"] = "Bar"
+
+            # Betrag: Pay-/Summe-Zeile bevorzugen
+            amount_candidates = []
+
+            for m in re.finditer(r"(?is)(KAUFLAND PAY|LIDL PAY|ZU ZAHLEN|SUMME)[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
+                amount_candidates.append(m.group(2))
+
+            if amount_candidates:
+                try:
+                    vals = [float(x.replace(",", ".")) for x in amount_candidates]
+                    best["Betrag (€)"] = max(vals)
+                except Exception:
+                    pass
+
+            rtype = "grocery"
+
         else:
             rtype = best.get("Belegtyp", "generic")
 
@@ -5177,27 +5185,6 @@ def scan_pdf_receipt(
             except Exception as e:
                 print(f"⚠️ Fuel-Spezialparser (PDF) fehlgeschlagen: {e}")
 
-        # 6) Prüfstatus
-        def _status_from(d: dict) -> str:
-            betrag = d.get("Betrag (€)")
-            laden = d.get("Laden")
-            zahl = d.get("Zahlung")
-            rtype = d.get("Belegtyp")
-
-            if betrag in (None, "", 0, 0.0):
-                return "Prüfen: Betrag fehlt/unsicher"
-
-            if not laden or len(str(laden).strip()) < 4:
-                return "Prüfen: Laden unsicher"
-
-            if not rtype or rtype == "generic":
-                return "Prüfen: Typ unsicher"
-
-            if not zahl:
-                return "Prüfen: Zahlung fehlt"
-
-            return "OK"
-
         # Typ nach Rohtext nachschärfen
         best["Belegtyp"] = refine_receipt_type_from_text(
             best.get("Rohtext", ""),
@@ -5205,29 +5192,29 @@ def scan_pdf_receipt(
         )
         rtype = best.get("Belegtyp", rtype)
 
-        print("\n=== DEBUG VOR STATUS 5 ===")
-        print(best)
+        #print("\n=== DEBUG VOR STATUS 5 ===")
+        #print(best)
         pruefstatus = _status_from(best)
         best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
 
         # 7) Optionaler Review
         reviewed = best
-        if 'review_and_correct' in globals():
-            want_review = (
-                review_when.lower() == "immer" or
-                (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
-            )
-            if want_review:
-                try:
-                    reviewed = review_and_correct(best) or best
-                except Exception as e:
-                    print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
+        #if 'review_and_correct' in globals():
+        #    want_review = (
+        #        review_when.lower() == "immer" or
+        #        (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
+        #    )
+        #    if want_review:
+        #        try:
+        #            reviewed = review_and_correct(best) or best
+        #        except Exception as e:
+        #            print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
         # 8) Excel schreiben
         try:
             reviewed.setdefault("Belegtyp", rtype)
-            print("\n=== DEBUG VOR EXCEL 4 ===")
-            print(reviewed)
+            #print("\n=== DEBUG VOR EXCEL 4 ===")
+            #print(reviewed)
             append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
             print(f"✅ Gespeichert nach: {excel_path}")
         except Exception as e:
@@ -5299,7 +5286,7 @@ def batch_scan_folder(folder: str,
                     excel_path=excel_path,
                     review_when=review_when,
                     strict_total=strict_total,
-                    show_debug_footer=True,
+                    show_debug_footer=False,
                 )
             else:
                 # Mehrteiliger Bon (mehrere Bilder)
@@ -5309,7 +5296,7 @@ def batch_scan_folder(folder: str,
                     excel_path=excel_path,
                     review_when=review_when,
                     strict_total=strict_total,
-                    show_debug_footer=True,
+                    show_debug_footer=False,
                 )
     
             # Ergebnis prüfen
@@ -5363,25 +5350,7 @@ def batch_scan_folder(folder: str,
 # =================== Start ===================
 
 if __name__ == "__main__":
-    TEST_IMAGE = ""
-    if os.path.exists(TEST_IMAGE):
-        scan_kassenbon(TEST_IMAGE, excel_path="kassenbons.xlsx")
-    else:
-        print(f"❗ Testbild nicht gefunden: {TEST_IMAGE}")
-
-batch_scan_folder(
-    r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons",
-    excel_path=EXCEL_PATH,
-    review_when="prüfen",   # nur unsichere Fälle manuell
-    strict_total=True,
-    move_processed=True,    # sortiert nach _ok / _reviewed / _error
-    verbose=True
-)
-
-# ===================== Entry-Point =====================
-
-if __name__ == "__main__":
-    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons\Apotheke.png"  # Datei ODER Ordner
+    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons"  # Datei ODER Ordner
     EXCEL_PATH      = "kassenbons.xlsx"
     REVIEW_WHEN     = "prüfen"
     STRICT_TOTAL    = True
