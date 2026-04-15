@@ -28,8 +28,10 @@ from paddleocr import PaddleOCR
 FAST = True
 DEBUG_OCR_TYPES = False   # zeigt "DEBUG ocr_text_multi types: [...]"
 DEBUG_PAYMENTS  = True   # zeigt "💳 Zahlungsart ..." Debug-Ausgaben
-DEBUG_PRINTS = True  # global
-DEBUG_HEAD = True  # bei Bedarf auf False setzen
+DEBUG_PRINTS = False  # global
+DEBUG_HEAD = False  # bei Bedarf auf False setzen
+DEBUG_FOOTER = False
+DEBUG_ALL = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,7 +56,8 @@ os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
 
 # ==== Debug-Helfer ====
 def _print_clean_blocks(label: str, text: str, n_head: int = 15, n_tail: int = 25, multi: bool = False):
-    if not isinstance(text, str):
+#    if not isinstance(text, str):
+    if not DEBUG_HEAD:
         return
     tag = " (multi)" if multi else ""
     lines = text.splitlines()
@@ -126,13 +129,6 @@ def _columns_for_type(rtype: str) -> list[str]:
     return base
 
 import re
-
-def coerce_type_by_store(store: str, fallback: str = "grocery") -> str | None:
-    """Erzwingt einen Belegtyp anhand des Laden-Namens."""
-    s = (store or "").upper()
-    if re.search(r"\b(NIELSEN|SCAN-?SHOP)\b", s):
-        return "grocery"
-    return None  # kein Override
 
 
 def _order_row_for_columns(row: dict, columns: list) -> dict:
@@ -567,26 +563,6 @@ def _find_value_after_label(lines, label_regex, window=3,
 
 import re
 
-def _is_bad_store_name(name: str) -> bool:
-    if not name:
-        return True
-    s = name.strip()
-    if len(s) < 4:
-        return True
-    if re.search(r"\d|EUR|€", s, re.I):
-        return True
-    vowels = len(re.findall(r"[AEIOUÄÖÜaeiouäöü]", s))
-    letters = len(re.findall(r"[A-Za-zÄÖÜäöü]", s))
-    if letters >= 6 and vowels <= 1:
-        return True
-    tokens = [t for t in s.split() if t]
-    short_tokens = sum(1 for t in tokens if len(t) == 1)
-    if short_tokens >= 2 and len(tokens) <= 4:
-        return True
-    if re.search(r"[A-Za-z]\s{2,}[A-Za-z]", s):
-        return True
-    return False
-
 def _pick_total_candidate(text: str) -> float | None:
     money = r"(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})"
     kw = r"(zu\s*zahlen|endbetrag|gesamt|summe|betrag|total)"
@@ -606,25 +582,6 @@ def _pick_total_candidate(text: str) -> float | None:
 
 def _is_plausible_amount(v: float) -> bool:
     return (v is not None) and (0 < v <= 2000)
-
-def _is_bad_store_name(name: str) -> bool:
-    s = (name or "").strip()
-    if not s:
-        return True
-    if len(s) < 4:
-        return True
-    # viele einzelne/kaputte OCR-Wörter
-    if sum(1 for w in s.split() if len(w) <= 2) >= 2:
-        return True
-    # sehr viele Leerstellen mitten im Wort
-    if "  " in s:
-        return True
-    # kaum Vokale -> oft OCR-Müll
-    letters = [c for c in s if c.isalpha()]
-    vowels  = [c for c in s.lower() if c in "aeiouäöü"]
-    if len(letters) >= 6 and len(vowels) <= 1:
-        return True
-    return False
 # =================== OCR Varianten ===================
 
 # ======= Kachelung für sehr lange Bilder (AUTO) =======
@@ -742,17 +699,6 @@ def _fix_common_terms(s: str) -> str:
         t = re.sub(pat, rep, t, flags=re.IGNORECASE)
     return t
     return s
-
-def _fix_spaced_letters(line: str) -> str:
-    """
-    Verbindet gesperrte Wörter wie 'S C A N  S H O P' → 'SCAN SHOP'.
-    Wir fassen NUR Sequenzen aus >=3 Ein-Buchstaben-Tokens zusammen.
-    """
-    import re
-    def join_match(m: re.Match) -> str:
-        s = m.group(0)
-        return s.replace(" ", "")
-    return re.sub(r'\b(?:[A-Za-zÄÖÜäöü]\s+){2,}[A-Za-zÄÖÜäöü]\b', join_match, line)
 
 def _guess_store_from_header(text: str) -> str | None:
     """
@@ -1634,7 +1580,6 @@ def ocr_text_multi(image_path: str) -> list[str]:
             txts.append(safe_post_ocr_cleanup(hdr_txt))
     except Exception:
         pass
-
     try:
         _print_clean_head("(multi)",
                       safe_post_ocr_cleanup("\n".join(txts[:30])),
@@ -4430,6 +4375,56 @@ def _status_from(d: dict) -> str:
 
     return "OK"
 
+def enrich_fuel_data(best: dict):
+    import re
+
+    raw = best.get("Rohtext", "") or ""
+
+    # 1) Spezialfelder
+    try:
+        fuel_spec = extract_fuel_details_from_text(raw) or {}
+        for k, v in fuel_spec.items():
+            if v not in (None, "", 0):
+                if k not in best or best.get(k) in (None, "", 0):
+                    best[k] = v
+    except Exception as e:
+        print(f"⚠️ Fuel-Spezialparser fehlgeschlagen: {e}")
+
+    # 2) Datum/Uhrzeit-Fallback
+    if not best.get("Datum") or not best.get("Uhrzeit"):
+        m = re.search(r"\b(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})\b", raw)
+        if m:
+            raw_date, raw_time = m.groups()
+
+            md = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
+            if md:
+                dd, mm, yy = md.groups()
+                if len(yy) == 2:
+                    yy = "20" + yy
+                best.setdefault("Datum", f"{yy}-{mm}-{dd}")
+
+            best.setdefault("Uhrzeit", raw_time)
+
+    return best
+
+def enrich_grocery_data(best: dict):
+    import re
+    raw = best.get("Rohtext", "") or ""
+
+    # Betrag robuster sichern (falls nötig)
+    if not best.get("Betrag (€)"):
+        matches = re.findall(r"(?:SUMME|ZU ZAHLEN)[^\d]{0,40}(\d{1,4}[.,]\d{2})", raw, re.I)
+        if matches:
+            vals = [float(x.replace(",", ".")) for x in matches]
+            best["Betrag (€)"] = max(vals)
+
+    return best
+
+ENRICHERS = {
+    "fuel": enrich_fuel_data,
+    "grocery": enrich_grocery_data,
+}
+
 def scan_kassenbon(
     image_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -4542,7 +4537,7 @@ def scan_kassenbon(
     combo_raw = "\n".join(texts)
     combo_text = safe_post_ocr_cleanup(combo_raw)
 
-    if show_debug_footer or debug_print:
+    if DEBUG_HEAD:
         print("\n--- CLEAN HEAD ---")
         for ln in combo_text.splitlines()[:20]:
             print(ln)
@@ -4582,17 +4577,9 @@ def scan_kassenbon(
     #print("\n=== DEBUG VOR STATUS ===")
     #print(best)
 
-    # Fuel-Spezialfelder nur ergänzen, nicht Basisdaten überschreiben
-    if best.get("Belegtyp") == "fuel":
-        try:
-            fuel_spec = extract_fuel_details_from_text(best.get("Rohtext", "")) or {}
-            for k, v in fuel_spec.items():
-                if v not in (None, "", 0):
-                    if k not in best or best.get(k) in (None, "", 0):
-                        best[k] = v
-        except Exception as e:
-            print(f"⚠️ Fuel-Spezialparser fehlgeschlagen: {e}")
-
+    rtype = best.get("Belegtyp")
+    if rtype in ENRICHERS:
+        best = ENRICHERS[rtype](best)
 
     pruefstatus = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
@@ -4679,7 +4666,7 @@ def scan_kassenbon_group(
     #print(f"STORE-CANDIDATE: {cand_store!r}")
 
 
-    if show_debug_footer or debug_print:
+    if DEBUG_HEAD:
         print("\n--- CLEAN (letzte 25 Zeilen, multi) ---")
         for ln in combo_text.splitlines()[-25:]:
             print(ln)
@@ -5175,15 +5162,10 @@ def scan_pdf_receipt(
                     if brand in txt_up:
                         best["Laden"] = brand
                         break
-        if best.get("Belegtyp") == "fuel":
-            try:
-                fuel_spec = extract_fuel_details_from_text(best.get("Rohtext", "")) or {}
-                for k, v in fuel_spec.items():
-                    if v not in (None, "", 0):
-                        if k not in best or best.get(k) in (None, "", 0):
-                            best[k] = v
-            except Exception as e:
-                print(f"⚠️ Fuel-Spezialparser (PDF) fehlgeschlagen: {e}")
+
+        rtype = best.get("Belegtyp", rtype)
+        if rtype in ENRICHERS:
+            best = ENRICHERS[rtype](best)
 
         # Typ nach Rohtext nachschärfen
         best["Belegtyp"] = refine_receipt_type_from_text(
