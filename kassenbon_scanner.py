@@ -4994,6 +4994,102 @@ def group_receipt_parts(filepaths: list[str]) -> dict[str, list[str]]:
         groups[k].sort(key=_part_order_key)
     return dict(groups)
 
+def parse_pdf_fuel_block(best, text, txt_up):
+    import re
+
+    # Laden
+    m_store = re.search(r"(ZG\s+TANKSTELLE[^\n\r]*)", text, flags=re.I)
+    if m_store:
+        best["Laden"] = m_store.group(1).strip()
+    elif re.search(r"HONECK-WALDSCHÜTZ ENERGIE", txt_up):
+        best["Laden"] = "Honeck-Waldschütz Energie GmbH"
+
+    # Datum / Uhrzeit
+    m_dt = re.search(r"(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})", text)
+    if m_dt:
+        m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m_dt.group(1))
+        if m_date:
+            dd, mm, yy = m_date.groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+            best["Datum"] = f"{yy}-{mm}-{dd}"
+            best["Uhrzeit"] = m_dt.group(2)
+
+    # Kraftstoffart
+    if re.search(r"\bSUPER(\s*E10|\s*E5| BLFR\.)?\b", txt_up):
+        best["Kraftstoffart"] = "Super"
+    elif re.search(r"\bDIESEL\b", txt_up):
+        best["Kraftstoffart"] = "Diesel"
+
+    # Zahlung
+    if re.search(r"\bABGEBUCHT\b", txt_up) or re.search(r"\bIBAN\b", txt_up):
+        best["Zahlung"] = "Lastschrift"
+
+    # Betrag
+    amount_candidates = []
+
+    for m in re.finditer(r"(?is)(\d{1,4}[.,]\d{2})\s*\*?\s*ENDBETRAG", text):
+        amount_candidates.append(m.group(1))
+
+    for m in re.finditer(r"(?is)ENDBETRAG[^\d]{0,40}(\d{1,4}[.,]\d{2})", text):
+        amount_candidates.append(m.group(1))
+
+    for m in re.finditer(r"(?is)BRUTTOBETRAG[^\d]{0,60}(\d{1,4}[.,]\d{2})", text):
+        amount_candidates.append(m.group(1))
+
+    for m in re.finditer(r"(?is)\bSUMME\b[^\d]{0,40}(\d{1,4}[.,]\d{2})", text):
+        amount_candidates.append(m.group(1))
+
+    if amount_candidates:
+        try:
+            vals = [float(x.replace(",", ".")) for x in amount_candidates]
+            best["Betrag (€)"] = max(vals)
+        except Exception:
+            pass
+
+    return best
+
+def parse_pdf_grocery_block(best, text, txt_up):
+    import re
+
+    # Laden
+    for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
+        if brand in txt_up:
+            best["Laden"] = brand
+            break
+
+    # Datum / Uhrzeit
+    m_dt = re.search(r"(\d{2}[.,]\d{2}[.,]\d{2,4}).*?(\d{2}:\d{2})(?::\d{2})?", text)
+    if m_dt:
+        raw_date = m_dt.group(1).replace(",", ".")
+        m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
+        if m_date:
+            dd, mm, yy = m_date.groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+            best["Datum"] = f"{yy}-{mm}-{dd}"
+        best["Uhrzeit"] = m_dt.group(2)
+
+    # Zahlung
+    if re.search(r"\b(LIDL PAY|KAUFLAND PAY|BLUECODE|EC|GIROCARD|VISA|MASTERCARD|KARTE)\b", txt_up):
+        best["Zahlung"] = "Karte"
+    elif re.search(r"\bBAR\b", txt_up):
+        best["Zahlung"] = "Bar"
+
+    # Betrag
+    amount_candidates = []
+    for m in re.finditer(r"(?is)(KAUFLAND PAY|LIDL PAY|ZU ZAHLEN|SUMME)[^\d]{0,40}(\d{1,4}[.,]\d{2})", text):
+        amount_candidates.append(m.group(2))
+
+    if amount_candidates:
+        try:
+            vals = [float(x.replace(",", ".")) for x in amount_candidates]
+            best["Betrag (€)"] = max(vals)
+        except Exception:
+            pass
+
+    return best
+
 #===============================================================================
 def scan_pdf_receipt(
     pdf_path: str,
@@ -5042,105 +5138,12 @@ def scan_pdf_receipt(
         # Fuel-Rechnung gezielt nachschärfen
         if re.search(r"\b(TANKRECHNUNG|TANKSTELLE|SUPER|DIESEL|EUR/L|LITER|KRAFTSTOFF)\b", txt_up):
             best["Belegtyp"] = "fuel"
-
-            # Laden
-            m_store = re.search(r"(ZG\s+TANKSTELLE[^\n\r]*)", combined_text, flags=re.I)
-            if m_store:
-                best["Laden"] = m_store.group(1).strip()
-            elif re.search(r"HONECK-WALDSCHÜTZ ENERGIE", txt_up):
-                best["Laden"] = "Honeck-Waldschütz Energie GmbH"
-
-            # Datum / Uhrzeit
-            m_dt = re.search(r"(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})", combined_text)
-            if m_dt:
-                m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", m_dt.group(1))
-                if m_date:
-                    dd, mm, yy = m_date.groups()
-                    if len(yy) == 2:
-                        yy = "20" + yy
-                    best["Datum"] = f"{yy}-{mm}-{dd}"
-                    best["Uhrzeit"] = m_dt.group(2)
-
-            # Kraftstoffart
-            if re.search(r"\bSUPER(\s*E10|\s*E5| BLFR\.)?\b", txt_up):
-                best["Kraftstoffart"] = "Super"
-            elif re.search(r"\bDIESEL\b", txt_up):
-                best["Kraftstoffart"] = "Diesel"
-
-            # Zahlung
-            if re.search(r"\bABGEBUCHT\b", txt_up) or re.search(r"\bIBAN\b", txt_up):
-                best["Zahlung"] = "Lastschrift"
-
-            # Betrag: Endbetrag / Bruttobetrag bevorzugen
-            # Betrag: Endbetrag / Bruttobetrag bevorzugen
-            amount_candidates = []
-
-            # 1) Endbetrag
-            for m in re.finditer(r"(?is)(\d{1,4}[.,]\d{2})\s*\*?\s*ENDBETRAG", combined_text):
-                amount_candidates.append(m.group(1))
-            for m in re.finditer(r"(?is)ENDBETRAG[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
-                amount_candidates.append(m.group(1))
-
-            # 2) Bruttobetrag
-            for m in re.finditer(r"(?is)BRUTTOBETRAG[^\d]{0,60}(\d{1,4}[.,]\d{2})", combined_text):
-                amount_candidates.append(m.group(1))
-
-            # 3) Fallback: Summe
-            for m in re.finditer(r"(?is)\bSUMME\b[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
-                amount_candidates.append(m.group(1))
-
-            if amount_candidates:
-                try:
-                    vals = [float(x.replace(",", ".")) for x in amount_candidates]
-                    best["Betrag (€)"] = max(vals)
-                except Exception:
-                    pass
-
+            best = parse_pdf_fuel_block(best, combined_text, txt_up)
             rtype = "fuel"
-
         elif re.search(r"\b(KAUFLAND|LIDL|ALDI|REWE|EDEKA|NETTO|PENNY)\b", txt_up):
-            # Grocery-/Retail-PDF gezielt nachschärfen
             best["Belegtyp"] = "grocery"
-
-            # Laden
-            for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
-                if brand in txt_up:
-                    best["Laden"] = brand
-                    break
-
-            # Datum / Uhrzeit
-            m_dt = re.search(r"(\d{2}[.,]\d{2}[.,]\d{2,4}).*?(\d{2}:\d{2})(?::\d{2})?", combined_text)
-            if m_dt:
-                raw_date = m_dt.group(1).replace(",", ".")
-                m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", raw_date)
-                if m_date:
-                    dd, mm, yy = m_date.groups()
-                    if len(yy) == 2:
-                        yy = "20" + yy
-                    best["Datum"] = f"{yy}-{mm}-{dd}"
-                best["Uhrzeit"] = m_dt.group(2)
-
-            # Zahlung
-            if re.search(r"\b(LIDL PAY|KAUFLAND PAY|BLUECODE|EC|GIROCARD|VISA|MASTERCARD|KARTE)\b", txt_up):
-                best["Zahlung"] = "Karte"
-            elif re.search(r"\bBAR\b", txt_up):
-                best["Zahlung"] = "Bar"
-
-            # Betrag: Pay-/Summe-Zeile bevorzugen
-            amount_candidates = []
-
-            for m in re.finditer(r"(?is)(KAUFLAND PAY|LIDL PAY|ZU ZAHLEN|SUMME)[^\d]{0,40}(\d{1,4}[.,]\d{2})", combined_text):
-                amount_candidates.append(m.group(2))
-
-            if amount_candidates:
-                try:
-                    vals = [float(x.replace(",", ".")) for x in amount_candidates]
-                    best["Betrag (€)"] = max(vals)
-                except Exception:
-                    pass
-
+            best = parse_pdf_grocery_block(best, combined_text, txt_up)
             rtype = "grocery"
-
         else:
             rtype = best.get("Belegtyp", "generic")
 
