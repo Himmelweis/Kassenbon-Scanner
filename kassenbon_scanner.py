@@ -5090,6 +5090,29 @@ def parse_pdf_grocery_block(best, text, txt_up):
 
     return best
 
+def fix_store_from_known_brands(best: dict, txt_up: str) -> dict:
+    import re
+
+    if not best.get("Laden"):
+        return best
+
+    cur_store = str(best["Laden"]).upper()
+
+    looks_bad_store = (
+        re.search(r"\b\d{5}\b", cur_store) is not None or
+        re.search(r"\b(STRASSE|STRAßE|STR\.|WEG|PLATZ|ALLEE|HÖHE|HOEHE)\b", cur_store) is not None or
+        re.fullmatch(r"DE\d{6,}", cur_store) is not None or
+        re.fullmatch(r"[\d\s\-./]+", cur_store) is not None
+    )
+
+    if looks_bad_store:
+        for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
+            if brand in txt_up:
+                best["Laden"] = brand
+                break
+
+    return best
+
 #===============================================================================
 def scan_pdf_receipt(
     pdf_path: str,
@@ -5150,21 +5173,7 @@ def scan_pdf_receipt(
         rtype = best.get("Belegtyp", "generic")
 
         # Wenn im ganzen PDF klar eine Marke vorkommt, aber der Laden wie eine Adresse aussieht:
-        if best.get("Laden"):
-            cur_store = best["Laden"].upper()
-
-            looks_bad_store = (
-                re.search(r"\b\d{5}\b", cur_store) is not None or
-                re.search(r"\b(STRASSE|STRAßE|STR\.|WEG|PLATZ|ALLEE|HÖHE|HOEHE)\b", cur_store) is not None or
-                re.fullmatch(r"DE\d{6,}", cur_store) is not None or
-                re.fullmatch(r"[\d\s\-./]+", cur_store) is not None
-            )
-
-            if looks_bad_store:
-                for brand in ["KAUFLAND", "LIDL", "ALDI", "REWE", "EDEKA", "NETTO", "PENNY"]:
-                    if brand in txt_up:
-                        best["Laden"] = brand
-                        break
+        best = fix_store_from_known_brands(best, txt_up)
 
         rtype = best.get("Belegtyp", rtype)
         if rtype in ENRICHERS:
