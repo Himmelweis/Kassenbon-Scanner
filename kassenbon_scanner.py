@@ -4425,6 +4425,20 @@ ENRICHERS = {
     "grocery": enrich_grocery_data,
 }
 
+def apply_enrichers(best: dict, rtype: str | None = None) -> tuple[dict, str]:
+    rtype = rtype or best.get("Belegtyp", "generic")
+
+    if rtype in ENRICHERS:
+        best = ENRICHERS[rtype](best)
+
+    best["Belegtyp"] = refine_receipt_type_from_text(
+        best.get("Rohtext", ""),
+        best.get("Belegtyp", rtype)
+    )
+    rtype = best.get("Belegtyp", rtype)
+
+    return best, rtype
+
 def scan_kassenbon(
     image_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -4577,27 +4591,10 @@ def scan_kassenbon(
     #print("\n=== DEBUG VOR STATUS ===")
     #print(best)
 
-    rtype = best.get("Belegtyp")
-    if rtype in ENRICHERS:
-        best = ENRICHERS[rtype](best)
+    best, rtype = apply_enrichers(best, best.get("Belegtyp"))
 
     pruefstatus = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
-
-    # =========================
-    # Optionaler Review-Dialog
-    # =========================
-    #reviewed = best
-    #if 'review_and_correct' in globals():
-    #    want_review = (
-    #        review_when.lower() == "immer" or
-    #        (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
-    #    )
-    #    if want_review:
-    #try:
-    #    reviewed = review_and_correct(best) or best
-    #except Exception as e:
-    #    print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
 
     reviewed = best
     # Werte noch einmal säubern
@@ -5175,17 +5172,7 @@ def scan_pdf_receipt(
         # Wenn im ganzen PDF klar eine Marke vorkommt, aber der Laden wie eine Adresse aussieht:
         best = fix_store_from_known_brands(best, txt_up)
 
-        rtype = best.get("Belegtyp", rtype)
-        if rtype in ENRICHERS:
-            best = ENRICHERS[rtype](best)
-
-        # Typ nach Rohtext nachschärfen
-        best["Belegtyp"] = refine_receipt_type_from_text(
-            best.get("Rohtext", ""),
-            best.get("Belegtyp", "generic")
-        )
-        rtype = best.get("Belegtyp", rtype)
-
+        best, rtype = apply_enrichers(best, rtype)
         #print("\n=== DEBUG VOR STATUS 5 ===")
         #print(best)
         pruefstatus = _status_from(best)
