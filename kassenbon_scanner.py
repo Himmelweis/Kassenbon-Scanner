@@ -2389,6 +2389,47 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
     lines.sort(key=lambda d: (d["cy"], d["x1"]))
     return lines
 
+def normalize_tax_fields(best: dict) -> dict:
+    """
+    Vereinheitlicht MwSt/Netto-Felder.
+    Bei gemischten Steuersätzen werden die globalen Felder geleert,
+    damit keine falschen Einzelwerte in der Haupttabelle stehen.
+    """
+    import re
+
+    rates = set()
+
+    # 1) zuerst explizit gesammelte Steuersätze verwenden
+    tax_rates = best.get("_tax_rates_found")
+    if isinstance(tax_rates, (set, list, tuple)):
+        for x in tax_rates:
+            try:
+                rates.add(int(x))
+            except Exception:
+                pass
+
+    # 2) Fallback: direkt aus Rohtext erkennen
+    raw = (best.get("Rohtext") or "").upper()
+
+    # typische Muster: "A 7 %", "B 19 %", "7,00", "19,00", "7 %", "19 %"
+    if re.search(r"\b7\s*%", raw) or re.search(r"\b7[.,]00\b", raw):
+        rates.add(7)
+    if re.search(r"\b19\s*%", raw) or re.search(r"\b19[.,]00\b", raw):
+        rates.add(19)
+
+    # 3) Entscheidung
+    if len(rates) == 1:
+        best["MwSt %"] = list(rates)[0]
+    elif len(rates) > 1:
+        best.pop("MwSt %", None)
+        best.pop("MwSt (€)", None)
+        best.pop("Netto (€)", None)
+
+    # internes Hilfsfeld nicht nach Excel durchreichen
+    best.pop("_tax_rates_found", None)
+
+    return best
+
 def parse_receipt_blocks(lines: list[dict]) -> dict:
     """
     Parst PaddleOCR-Zeilen in ein Ergebnis-Dict.
@@ -2649,15 +2690,13 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
                     if gross_from_tax is None:
                         gross_from_tax = bigger[0][0]
 
+    out["_tax_rates_found"] = sorted(tax_rates_found)
+
     if len(tax_rates_found) == 1:
         tax_rate = list(tax_rates_found)[0]
         out["MwSt %"] = tax_rate
     else:
-        # gemischte Steuersätze → nicht global setzen
         tax_rate = None
-        out.pop("MwSt %", None)
-        out.pop("MwSt (€)", None)
-        out.pop("Netto (€)", None)
 
     if tax_amount:
         try:
@@ -4592,6 +4631,7 @@ def scan_kassenbon(
     #print(best)
 
     best, rtype = apply_enrichers(best, best.get("Belegtyp"))
+    best = normalize_tax_fields(best)
 
     pruefstatus = _status_from(best)
     best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
@@ -5173,6 +5213,7 @@ def scan_pdf_receipt(
         best = fix_store_from_known_brands(best, txt_up)
 
         best, rtype = apply_enrichers(best, rtype)
+        best = normalize_tax_fields(best)
         #print("\n=== DEBUG VOR STATUS 5 ===")
         #print(best)
         pruefstatus = _status_from(best)
