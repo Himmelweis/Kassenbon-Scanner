@@ -4444,6 +4444,33 @@ def enrich_fuel_data(best: dict):
 
             best.setdefault("Uhrzeit", raw_time)
 
+    # 3) Steuer/Netto bei Fuel plausibel ergänzen
+    try:
+        brutto = best.get("Betrag (€)")
+        mwst_prozent = best.get("MwSt %")
+
+        # Fallback: MwSt-Satz direkt aus Rohtext ableiten
+        if mwst_prozent not in (7, 19):
+            if re.search(r"\b19\s*%", raw) or re.search(r"\b19[.,]00\b", raw):
+                mwst_prozent = 19
+            elif re.search(r"\b7\s*%", raw) or re.search(r"\b7[.,]00\b", raw):
+                mwst_prozent = 7
+
+        if isinstance(brutto, (int, float)) and mwst_prozent == 19:
+            netto = round(brutto / 1.19, 2)
+            mwst = round(brutto - netto, 2)
+
+            best.setdefault("MwSt %", 19)
+
+            if not isinstance(best.get("Netto (€)"), (int, float)):
+                best["Netto (€)"] = netto
+
+            if not isinstance(best.get("MwSt (€)"), (int, float)):
+                best["MwSt (€)"] = mwst
+
+    except Exception:
+        pass
+
     return best
 
 def enrich_grocery_data(best: dict):
