@@ -4394,25 +4394,40 @@ def refine_receipt_type_from_text(raw_text: str, current_type: str = "generic") 
 
     return current_type or "generic"
 
-def _status_from(d: dict) -> str:
-    betrag = d.get("Betrag (€)")
-    laden = d.get("Laden")
-    zahl = d.get("Zahlung")
-    rtype = d.get("Belegtyp")
+def _status_from(best: dict) -> str:
+    reasons = []
 
-    if betrag in (None, "", 0, 0.0):
-        return "Prüfen: Betrag fehlt/unsicher"
+    # Betrag
+    betrag = best.get("Betrag (€)")
+    if not isinstance(betrag, (int, float)) or betrag <= 0:
+        reasons.append("Betrag fehlt/ungültig")
 
-    if not laden or len(str(laden).strip()) < 4:
-        return "Prüfen: Laden unsicher"
+    # Datum
+    if not best.get("Datum"):
+        reasons.append("Datum fehlt")
 
-    if not rtype or rtype == "generic":
-        return "Prüfen: Typ unsicher"
+    # Uhrzeit (optional, aber oft sinnvoll)
+    if not best.get("Uhrzeit"):
+        reasons.append("Uhrzeit fehlt")
 
-    if not zahl:
-        return "Prüfen: Zahlung fehlt"
+    # Laden
+    if not best.get("Laden"):
+        reasons.append("Laden fehlt")
 
-    return "OK"
+    # MwSt
+    mwst = best.get("MwSt %")
+    if mwst not in (7, 19, None):
+        reasons.append("MwSt unklar")
+
+    # Spezialfall: Fuel ohne MwSt
+    if best.get("Belegtyp") == "fuel" and mwst not in (7, 19):
+        reasons.append("MwSt fehlt (Fuel)")
+
+    # Ergebnis
+    if not reasons:
+        return "OK"
+
+    return "Prüfen: " + ", ".join(reasons)
 
 def enrich_fuel_data(best: dict):
     import re
