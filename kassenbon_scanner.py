@@ -11,7 +11,24 @@ Created on Sun Aug 31 19:14:15 2025
 # Foto -> OCR (mehrere Varianten) -> Parsing -> Merge -> Excel
 # kassenbon_scanner.py
 import os
+
+import os
+
+# Paddle / Paddlex leiser machen
+os.environ["FLAGS_log_level"] = "3"   # 0=debug, 3=error only
+os.environ["GLOG_minloglevel"] = "3"
+
+# Model-Check deaktivieren (hast du teilweise schon)
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+# oneDNN / MKL Spam reduzieren
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
 
 import torch
 import  re, cv2, pytesseract, pandas as pd, numpy as np
@@ -2392,7 +2409,6 @@ def append_to_excel_typed(row: dict, rtype: str, excel_path: str = "kassenbons.x
             df.to_excel(xls, sheet_name=sh_name, index=False)
 
 
-# ========= GUI Review & Helfer (OBERHALB von scan_kassenbon einfügen) =========
 def run_paddle_ocr(image_path: str) -> list[dict]:
     """
     Führt PaddleOCR auf einem Bild aus und gibt eine sortierte Liste von OCR-Zeilen zurück.
@@ -2401,11 +2417,19 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
     global _PADDLE_OCR
 
     if _PADDLE_OCR is None:
-        _PADDLE_OCR = PaddleOCR(
-            lang="en",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False
-        )
+        kwargs = {
+            "lang": "de",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+        }
+
+        try:
+            _PADDLE_OCR = PaddleOCR(show_log=False, **kwargs)
+        except Exception as e:
+            if "show_log" in str(e):
+                _PADDLE_OCR = PaddleOCR(**kwargs)
+            else:
+                raise
 
     result = _PADDLE_OCR.predict(str(image_path))
     if not result:
