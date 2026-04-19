@@ -2284,6 +2284,59 @@ def _dedupe_append(df: pd.DataFrame, row: dict, key_cols: list[str]) -> pd.DataF
         return df
     return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
 
+def build_receipt_signature(d: dict) -> str:
+    def norm_text(x):
+        return str(x or "").strip().lower()
+
+    def norm_amount(x):
+        if isinstance(x, (int, float)):
+            return f"{x:.2f}"
+        return norm_text(x)
+
+    parts = [
+        norm_text(d.get("Datum")),
+        norm_text(d.get("Uhrzeit")),
+        norm_text(d.get("Laden")),
+        norm_amount(d.get("Betrag (€)")),
+    ]
+    return "|".join(parts)
+
+def is_duplicate_receipt(d: dict, excel_path: str) -> bool:
+    import os
+    from openpyxl import load_workbook
+
+    if not os.path.exists(excel_path):
+        return False
+
+    sig_new = build_receipt_signature(d)
+
+    try:
+        wb = load_workbook(excel_path)
+        ws = wb.active
+
+        headers = [cell.value for cell in ws[1]]
+        col_map = {name: idx + 1 for idx, name in enumerate(headers) if name}
+
+        needed = ["Datum", "Uhrzeit", "Laden", "Betrag (€)"]
+        if not all(k in col_map for k in needed):
+            return False
+
+        for row in range(2, ws.max_row + 1):
+            existing = {
+                "Datum": ws.cell(row=row, column=col_map["Datum"]).value,
+                "Uhrzeit": ws.cell(row=row, column=col_map["Uhrzeit"]).value,
+                "Laden": ws.cell(row=row, column=col_map["Laden"]).value,
+                "Betrag (€)": ws.cell(row=row, column=col_map["Betrag (€)"]).value,
+            }
+            sig_old = build_receipt_signature(existing)
+            if sig_old == sig_new:
+                return True
+
+    except Exception:
+        return False
+
+    return False
+
 def append_to_excel_typed(row: dict, rtype: str, excel_path: str = "kassenbons.xlsx"):
     import os, pandas as pd
 
@@ -4695,6 +4748,9 @@ def scan_kassenbon(
     # Excel schreiben
     # =========================
     try:
+        if is_duplicate_receipt(reviewed, excel_path):
+            print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
+            return reviewed
         append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
         print(f"✅ Gespeichert nach: {excel_path}")
     except Exception as e:
@@ -5279,6 +5335,9 @@ def scan_pdf_receipt(
             reviewed.setdefault("Belegtyp", rtype)
             #print("\n=== DEBUG VOR EXCEL 4 ===")
             #print(reviewed)
+            if is_duplicate_receipt(reviewed, excel_path):
+                print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
+                return reviewed
             append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
             print(f"✅ Gespeichert nach: {excel_path}")
         except Exception as e:
