@@ -4,14 +4,10 @@ Created on Sun Aug 31 19:14:15 2025
 
 @author: ONeum
 """
-# Test-Commit – nur zum Überprüfen des GitHub Push
-# Test-Commit – nur zum Überprüfen des GitHub Push II
 
-# kassenbon_scanner.py
-# Foto -> OCR (mehrere Varianten) -> Parsing -> Merge -> Excel
-# kassenbon_scanner.py
-import os
-
+# =========================
+# CONFIG
+# =========================
 import os
 
 # Paddle / Paddlex leiser machen
@@ -57,6 +53,10 @@ EXCEL_PATH = os.path.join(BASE_DIR, "kassenbons.xlsx")
 
 USE_PADDLE = True
 _PADDLE_OCR = None
+
+# =========================
+# HELFER / BASISFUNKTIONEN
+# =========================
 
 def _print_clean_head(label: str, text: str, n: int = 20):
     if not DEBUG_HEAD:
@@ -145,8 +145,6 @@ def _columns_for_type(rtype: str) -> list[str]:
     base.append("Prüfstatus")
     return base
 
-import re
-
 
 def _order_row_for_columns(row: dict, columns: list) -> dict:
     """
@@ -157,8 +155,9 @@ def _order_row_for_columns(row: dict, columns: list) -> dict:
 # (optional) Für alte Aufrufer, die noch 'COLUMNS' verwenden:
 COLUMNS = MASTER_COLUMNS[:]  # wird nicht fürs Schreiben genutzt, aber bricht nix
 
-
-# --- OCR Settings ---
+# =========================
+# OCR / IO
+# =========================
 FAST = True  # ← auf True: schneller (1 Variante), auf False: 3 Varianten (besser)
 
 CUSTOM_CONFIG_MAIN = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
@@ -2301,6 +2300,10 @@ def _dedupe_append(df: pd.DataFrame, row: dict, key_cols: list[str]) -> pd.DataF
         return df
     return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
 
+# =========================
+# SPEICHERN / EXCEL
+# =========================
+
 def build_receipt_signature(d: dict) -> str:
     def norm_text(x):
         return str(x or "").strip().lower()
@@ -2408,6 +2411,9 @@ def append_to_excel_typed(row: dict, rtype: str, excel_path: str = "kassenbons.x
         for sh_name, df in sheets.items():
             df.to_excel(xls, sheet_name=sh_name, index=False)
 
+# =========================
+# OCR / DATEI-VERARBEITUNG
+# =========================
 
 def run_paddle_ocr(image_path: str) -> list[dict]:
     """
@@ -2506,6 +2512,9 @@ def normalize_tax_fields(best: dict) -> dict:
     best.pop("_tax_rates_found", None)
 
     return best
+# =========================
+# PARSER / EXTRAKTION
+# =========================
 
 def parse_receipt_blocks(lines: list[dict]) -> dict:
     """
@@ -4534,6 +4543,9 @@ def finalize_and_save_receipt(best: dict, rtype: str, excel_path: str):
         print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
 
     return reviewed
+# =========================
+# ENRICHER / NACHSCHÄRFUNG
+# =========================
 
 def enrich_fuel_data(best: dict):
     import re
@@ -4722,6 +4734,9 @@ def fix_truncated_day(date_str: str | None, raw: str) -> str | None:
         pass
 
     return date_str
+# =========================
+# HAUPTABLÄUFE / SCAN
+# =========================
 
 def scan_kassenbon(
     image_path: str,
@@ -5608,7 +5623,9 @@ def batch_scan_folder(folder: str,
     return {"total": total, "ok": okc, "pruefen": rc, "error": ec, "saved": saved}
 
 
-# =================== Start ===================
+# =========================
+# STARTPUNKT / MANUELLER LAUF
+# =========================
 
 if __name__ == "__main__":
     TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons"  # Datei ODER Ordner
