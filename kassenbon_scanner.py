@@ -4506,6 +4506,35 @@ def _status_from(best: dict) -> str:
 
     return "Prüfen: " + ", ".join(reasons)
 
+def finalize_and_save_receipt(best: dict, rtype: str, excel_path: str):
+    """
+    Setzt Prüfstatus, säubert Werte, prüft auf Duplikate und schreibt nach Excel.
+    Gibt das finale Dict zurück.
+    """
+    pruefstatus = _status_from(best)
+    best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
+
+    reviewed = best
+
+    try:
+        reviewed = _sanitize_dict_values(reviewed)
+    except Exception:
+        pass
+
+    reviewed.setdefault("Belegtyp", rtype)
+
+    if is_duplicate_receipt(reviewed, excel_path):
+        print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
+        return reviewed
+
+    try:
+        append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
+        print(f"✅ Gespeichert nach: {excel_path}")
+    except Exception as e:
+        print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
+
+    return reviewed
+
 def enrich_fuel_data(best: dict):
     import re
 
@@ -4596,6 +4625,103 @@ def apply_enrichers(best: dict, rtype: str | None = None) -> tuple[dict, str]:
     rtype = best.get("Belegtyp", rtype)
 
     return best, rtype
+
+def extract_best_datetime(text: str) -> tuple[str | None, str | None]:
+    """
+    Extrahiert ein plausibles Datum + Uhrzeit aus OCR-Text.
+    Akzeptiert z. B.:
+    - 27.02.26 07:55
+    - 27,02,26 07:55
+    - 7.02.2607:55
+    - 05.03.2026 16:38 Uhr
+    """
+    import re
+
+    if not text:
+        return None, None
+
+    candidates = re.findall(
+        r"\b(\d{1,2}[.,]\d{2}[.,]\d{2,4})\s*(\d{2}:\d{2})\b",
+        text
+    )
+
+    found = []
+
+    for raw_date, raw_time in candidates:
+        try:
+            hh, mi = map(int, raw_time.split(":"))
+            if hh > 23 or mi > 59:
+                continue
+
+            raw_date = raw_date.replace(",", ".")
+            md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
+            if not md:
+                continue
+
+            dd, mm, yy = md.groups()
+            if len(dd) == 1:
+                dd = "0" + dd
+            if len(yy) == 2:
+                yy = "20" + yy
+
+            # einfache Plausibilität
+            dd_i = int(dd)
+            mm_i = int(mm)
+            if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
+                continue
+
+            found.append((f"{yy}-{mm}-{dd}", raw_time))
+        except Exception:
+            continue
+
+    if not found:
+        return None, None
+
+    # meist steht das relevante Bon-Datum eher weit unten → letzten plausiblen Treffer nehmen
+    return found[-1]
+
+def fix_truncated_day(date_str: str | None, raw: str) -> str | None:
+    """
+    Korrigiert OCR-Fälle wie 7.02.26 -> 27.02.26,
+    wenn im Rohtext ein zweistelliger Tag mit gleichem Monat/Jahr vorkommt.
+    Erkennt sowohl:
+    - 27.02.26
+    - 27,02,26
+    - 270226
+    """
+    import re
+
+    if not date_str or not raw:
+        return date_str
+
+    try:
+        yy, mm, dd = date_str.split("-")
+        dd_i = int(dd)
+
+        # nur bei kleinem Tag prüfen
+        if dd_i >= 10:
+            return date_str
+
+        yy2 = yy[-2:]
+
+        # 1) normales OCR-Datum suchen
+        m1 = re.search(rf"\b(\d{{2}})[.,]{mm}[.,]{yy2}\b", raw)
+        if m1:
+            dd2 = int(m1.group(1))
+            if dd2 >= 10:
+                return f"{yy}-{mm}-{dd2:02d}"
+
+        # 2) kompaktes Muster DDMMYY suchen, z. B. 270226
+        m2 = re.search(rf"\b(\d{{2}}){mm}{yy2}\b", raw)
+        if m2:
+            dd2 = int(m2.group(1))
+            if dd2 >= 10:
+                return f"{yy}-{mm}-{dd2:02d}"
+
+    except Exception:
+        pass
+
+    return date_str
 
 def scan_kassenbon(
     image_path: str,
@@ -4752,35 +4878,52 @@ def scan_kassenbon(
     best, rtype = apply_enrichers(best, best.get("Belegtyp"))
     best = normalize_tax_fields(best)
 
-    pruefstatus = _status_from(best)
-    best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
+    # Letzte Stabilisierung vor dem Speichern
+    raw = best.get("Rohtext", "") or ""
+    txt_up = raw.upper()
 
-    reviewed = best
-    # Werte noch einmal säubern
+    if re.search(r"\bLIDL\b", txt_up):
+        best["Laden"] = "LIDL"
+    elif re.search(r"\bKAUFLAND\b", txt_up):
+        best["Laden"] = "KAUFLAND"
+
+    # 2) Unplausible Uhrzeit verwerfen
+    t = best.get("Uhrzeit")
+    if t:
+        m_t = re.match(r"^(\d{2}):(\d{2})$", str(t))
+        if m_t:
+            hh, mi = int(m_t.group(1)), int(m_t.group(2))
+            if hh > 23 or mi > 59:
+                best["Datum"] = None
+                best["Uhrzeit"] = None
+
+    # 3) Datum/Uhrzeit robust neu ziehen
+    if not best.get("Datum") or not best.get("Uhrzeit"):
+        dt_date, dt_time = extract_best_datetime(raw)
+        if dt_date and dt_time:
+            dt_date = fix_truncated_day(dt_date, raw)
+            best["Datum"] = dt_date
+            best["Uhrzeit"] = dt_time
+
+    # 4) Korrektur: führende Ziffer beim Tag fehlt (z. B. 7 statt 27)
     try:
-        reviewed = _sanitize_dict_values(reviewed)
+        datum = best.get("Datum")
+        if datum:
+            yy, mm, dd = datum.split("-")
+            dd_int = int(dd)
+
+            # nur wenn Tag sehr klein ist → typischer OCR-Verlust
+            if dd_int < 10:
+                # im Rohtext nach zweistelligem Datum suchen
+                m2 = re.search(rf"\b(\d{{2}})[.,]{mm}[.,]{yy[-2:]}", raw)
+                if m2:
+                    dd2 = int(m2.group(1))
+                    if dd2 > 9:
+                        best["Datum"] = f"{yy}-{mm}-{dd2:02d}"
     except Exception:
         pass
 
-    # Wenn Review den Typ nicht setzt, den erkannten Typ verwenden
-    reviewed.setdefault("Belegtyp", rtype)
-
-    #print("\n=== DEBUG VOR EXCEL ===")
-    #print(reviewed)
-
-    # =========================
-    # Excel schreiben
-    # =========================
-    try:
-        if is_duplicate_receipt(reviewed, excel_path):
-            print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
-            return reviewed
-        append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
-        print(f"✅ Gespeichert nach: {excel_path}")
-    except Exception as e:
-        print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
-
-    return reviewed
+    return finalize_and_save_receipt(best, rtype, excel_path)
 
 def scan_kassenbon_group(
     image_paths: list[str],
@@ -5338,36 +5481,7 @@ def scan_pdf_receipt(
         best = normalize_tax_fields(best)
         #print("\n=== DEBUG VOR STATUS 5 ===")
         #print(best)
-        pruefstatus = _status_from(best)
-        best["Prüfstatus"] = "✅ OK" if pruefstatus.upper().startswith("OK") else f"🔎 {pruefstatus}"
-
-        # 7) Optionaler Review
-        reviewed = best
-        #if 'review_and_correct' in globals():
-        #    want_review = (
-        #        review_when.lower() == "immer" or
-        #        (review_when.lower().startswith("prüf") and not pruefstatus.upper().startswith("OK"))
-        #    )
-        #    if want_review:
-        #        try:
-        #            reviewed = review_and_correct(best) or best
-        #        except Exception as e:
-        #            print(f"⚠️ Review-Dialog nicht verfügbar/abgebrochen: {e}")
-
-        # 8) Excel schreiben
-        try:
-            reviewed.setdefault("Belegtyp", rtype)
-            #print("\n=== DEBUG VOR EXCEL 4 ===")
-            #print(reviewed)
-            if is_duplicate_receipt(reviewed, excel_path):
-                print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
-                return reviewed
-            append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
-            print(f"✅ Gespeichert nach: {excel_path}")
-        except Exception as e:
-            print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
-
-        return reviewed
+        return finalize_and_save_receipt(best, rtype, excel_path)
 
     except Exception as e:
         print(f"❌ Fehler bei {pdf_path}: {e}")
