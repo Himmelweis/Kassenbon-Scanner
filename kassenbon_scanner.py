@@ -45,6 +45,8 @@ DEBUG_PRINTS = False  # global
 DEBUG_HEAD = False  # bei Bedarf auf False setzen
 DEBUG_FOOTER = False
 DEBUG_ALL = False
+TEST_MODE = False
+DEBUG_OCR_TIMING = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2414,13 +2416,38 @@ def append_to_excel_typed(row: dict, rtype: str, excel_path: str = "kassenbons.x
 # =========================
 # OCR / DATEI-VERARBEITUNG
 # =========================
+def resize_image_for_ocr(image_path: str, max_side: int = 2800) -> str:
+    """
+    Verkleinert ein Bild proportional für schnellere OCR.
+    Gibt den Pfad zum verkleinerten Temp-Bild zurück.
+    Wenn keine Verkleinerung nötig ist, wird der Originalpfad zurückgegeben.
+    """
+    import os
+    import tempfile
+    from PIL import Image
+
+    with Image.open(image_path) as img:
+        w, h = img.size
+        longest = max(w, h)
+
+        if longest <= max_side:
+            return str(image_path)
+
+        scale = max_side / float(longest)
+        new_size = (int(w * scale), int(h * scale))
+
+        img_resized = img.resize(new_size, Image.LANCZOS)
+
+        fd, temp_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        img_resized.save(temp_path, format="PNG")
+        return temp_path
 
 def run_paddle_ocr(image_path: str) -> list[dict]:
-    """
-    Führt PaddleOCR auf einem Bild aus und gibt eine sortierte Liste von OCR-Zeilen zurück.
-    Jede Zeile ist ein Dict mit text, score, x1, y1, x2, y2, cx, cy.
-    """
+    import time
     global _PADDLE_OCR
+
+    t0 = time.perf_counter()
 
     if _PADDLE_OCR is None:
         kwargs = {
@@ -2429,6 +2456,7 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
             "use_doc_unwarping": False,
         }
 
+        t_init0 = time.perf_counter()
         try:
             _PADDLE_OCR = PaddleOCR(show_log=False, **kwargs)
         except Exception as e:
@@ -2436,8 +2464,21 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
                 _PADDLE_OCR = PaddleOCR(**kwargs)
             else:
                 raise
+        print(f"⏱ OCR Init: {time.perf_counter() - t_init0:.2f}s")
 
-    result = _PADDLE_OCR.predict(str(image_path))
+    t_pred0 = time.perf_counter()
+    ocr_image_path = resize_image_for_ocr(str(image_path), max_side=2800)
+    result = _PADDLE_OCR.predict(ocr_image_path)
+    try:
+        if ocr_image_path != str(image_path):
+            import os
+            os.remove(ocr_image_path)
+    except Exception:
+        pass
+    if DEBUG_OCR_TIMING:
+        print(f"⏱ OCR Predict {image_path}: {time.perf_counter() - t_pred0:.2f}s")
+        print(f"⏱ OCR Total {image_path}: {time.perf_counter() - t0:.2f}s")
+
     if not result:
         return []
 
