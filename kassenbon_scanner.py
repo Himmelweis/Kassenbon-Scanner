@@ -42,11 +42,12 @@ FAST = True
 DEBUG_OCR_TYPES = False   # zeigt "DEBUG ocr_text_multi types: [...]"
 DEBUG_PAYMENTS  = True   # zeigt "💳 Zahlungsart ..." Debug-Ausgaben
 DEBUG_PRINTS = False  # global
-DEBUG_HEAD = False  # bei Bedarf auf False setzen
+DEBUG = False
+DEBUG_HEAD = False
+DEBUG_OCR_TIMING = False
 DEBUG_FOOTER = False
 DEBUG_ALL = False
 TEST_MODE = False
-DEBUG_OCR_TIMING = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2443,7 +2444,7 @@ def resize_image_for_ocr(image_path: str, max_side: int = 2800) -> str:
         img_resized.save(temp_path, format="PNG")
         return temp_path
 
-def run_paddle_ocr(image_path: str) -> list[dict]:
+def run_paddle_ocr(image_path: str, max_side: int = 3200) -> list[dict]:
     import time
     global _PADDLE_OCR
 
@@ -2464,10 +2465,11 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
                 _PADDLE_OCR = PaddleOCR(**kwargs)
             else:
                 raise
-        print(f"⏱ OCR Init: {time.perf_counter() - t_init0:.2f}s")
+        if DEBUG_OCR_TIMING:
+            print(f"⏱ OCR Init: {time.perf_counter() - t_init0:.2f}s")
 
     t_pred0 = time.perf_counter()
-    ocr_image_path = resize_image_for_ocr(str(image_path), max_side=2800)
+    ocr_image_path = resize_image_for_ocr(str(image_path), max_side=max_side)
     result = _PADDLE_OCR.predict(ocr_image_path)
     try:
         if ocr_image_path != str(image_path):
@@ -2513,46 +2515,37 @@ def run_paddle_ocr(image_path: str) -> list[dict]:
     lines.sort(key=lambda d: (d["cy"], d["x1"]))
     return lines
 
-def normalize_tax_fields(best: dict) -> dict:
+def infer_vat_rate_from_amounts(best: dict) -> dict:
     """
-    Vereinheitlicht MwSt/Netto-Felder.
-    Bei gemischten Steuersätzen werden die globalen Felder geleert,
-    damit keine falschen Einzelwerte in der Haupttabelle stehen.
+    Ergänzt MwSt %, wenn Brutto/Netto/MwSt plausibel vorliegen,
+    aber kein Satz gesetzt ist.
     """
-    import re
+    gross = best.get("Betrag (€)")
+    net = best.get("Netto (€)")
+    vat = best.get("MwSt (€)")
+    rate = best.get("MwSt %")
 
-    rates = set()
+    if rate in (7, 19):
+        return best
 
-    # 1) zuerst explizit gesammelte Steuersätze verwenden
-    tax_rates = best.get("_tax_rates_found")
-    if isinstance(tax_rates, (set, list, tuple)):
-        for x in tax_rates:
-            try:
-                rates.add(int(x))
-            except Exception:
-                pass
+    if not all(isinstance(x, (int, float)) for x in (gross, net, vat)):
+        return best
 
-    # 2) Fallback: direkt aus Rohtext erkennen
-    raw = (best.get("Rohtext") or "").upper()
+    if abs((net + vat) - gross) > 0.06:
+        return best
 
-    # typische Muster: "A 7 %", "B 19 %", "7,00", "19,00", "7 %", "19 %"
-    if re.search(r"\b7\s*%", raw) or re.search(r"\b7[.,]00\b", raw):
-        rates.add(7)
-    if re.search(r"\b19\s*%", raw) or re.search(r"\b19[.,]00\b", raw):
-        rates.add(19)
+    try:
+        inferred = round((vat / net) * 100, 2)
+    except Exception:
+        return best
 
-    # 3) Entscheidung
-    if len(rates) == 1:
-        best["MwSt %"] = list(rates)[0]
-    elif len(rates) > 1:
-        best.pop("MwSt %", None)
-        best.pop("MwSt (€)", None)
-        best.pop("Netto (€)", None)
-
-    # internes Hilfsfeld nicht nach Excel durchreichen
-    best.pop("_tax_rates_found", None)
+    if 6.5 <= inferred <= 7.5:
+        best["MwSt %"] = 7
+    elif 18.0 <= inferred <= 20.0:
+        best["MwSt %"] = 19
 
     return best
+
 # =========================
 # PARSER / EXTRAKTION
 # =========================
@@ -2646,46 +2639,116 @@ def parse_receipt_blocks(lines: list[dict]) -> dict:
     found_date = None
     found_time = None
 
-    # 1) zuerst kombinierte Zeilen suchen
-    for ln in lines:
+    bad_datetime_words = [
+        "startzeitpunkt",
+        "beendigungszeitpunkt",
+        "signatur",
+        "signaturzähler",
+        "signaturzahler",
+        "prüfwert",
+        "prufwert",
+        "tse",
+    ]
+
+    datetime_candidates = []
+
+    # 1) kombinierte Datum/Zeit-Zeilen sammeln und bewerten
+    for i, ln in enumerate(lines):
         txt = _txt(ln)
         if not txt:
             continue
 
-        m = re.search(r"(\d{2}\.\d{2}\.\d{2,4}).*?(\d{2}:\d{2})", txt)
-        if m:
-            found_date = m.group(1)
-            found_time = m.group(2)
-            break
+        txt_low = txt.lower()
 
-    # 2) falls nicht gefunden: getrennte Zeilen suchen, bevorzugt im unteren Bereich
-    if not found_date or not found_time:
+        if any(k in txt_low for k in bad_datetime_words):
+            continue
+
+        m = re.search(r"(\d{1,2}[.,]\d{2}[.,]\d{2,4})\s*(\d{2}:\d{2})", txt)
+        if not m:
+            continue
+
+        raw_date = m.group(1).replace(",", ".")
+        raw_time = m.group(2)
+
+        mt = re.match(r"(\d{2}):(\d{2})", raw_time)
+        if not mt:
+            continue
+
+        hh, mi = int(mt.group(1)), int(mt.group(2))
+        if hh > 23 or mi > 59:
+            continue
+
+        md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
+        if not md:
+            continue
+
+        dd, mm, yy = md.groups()
+        if len(dd) == 1:
+            dd = "0" + dd
+        if len(yy) == 2:
+            yy = "20" + yy
+
+        score = 0
+        context = " ".join(
+            _txt(x) for x in lines[max(0, i - 3): min(len(lines), i + 4)]
+        ).lower()
+
+        if "datum" in context:
+            score += 5
+        if "uhr" in txt_low or "uhrzeit" in context:
+            score += 5
+        if "bon" in context:
+            score += 2
+        if "kasse" in context or "filiale" in context:
+            score += 2
+
+        if any(k in context for k in bad_datetime_words):
+            score -= 10
+
+        datetime_candidates.append((score, i, f"{yy}-{mm}-{dd}", raw_time))
+
+    if datetime_candidates:
+        datetime_candidates.sort(key=lambda x: (x[0], x[1]))
+        _score, _i, date_norm, time_norm = datetime_candidates[-1]
+        out["Datum"] = date_norm
+        out["Uhrzeit"] = time_norm
+
+    # 2) falls nicht gefunden: getrennte Zeilen suchen, aber TSE/Signatur-Zeilen ignorieren
+    if not out.get("Datum") or not out.get("Uhrzeit"):
         for i in range(len(lines) - 1, -1, -1):
             txt = _txt(lines[i])
+            txt_low = txt.lower()
+
+            if any(k in txt_low for k in bad_datetime_words):
+                continue
 
             if not found_time:
                 m_time = re.search(r"\b(\d{2}:\d{2})\b", txt)
                 if m_time:
-                    found_time = m_time.group(1)
+                    hh, mi = map(int, m_time.group(1).split(":"))
+                    if hh <= 23 and mi <= 59:
+                        found_time = m_time.group(1)
 
             if not found_date:
-                m_date = re.search(r"\b(\d{2}\.\d{2}\.\d{2,4})\b", txt)
+                m_date = re.search(r"\b(\d{1,2}[.,]\d{2}[.,]\s*\d{2,4})\b", txt)
                 if m_date:
-                    found_date = m_date.group(1)
+                    found_date = m_date.group(1).replace(",", ".")
 
             if found_date and found_time:
                 break
 
-    if found_date:
-        m_date = re.match(r"(\d{2})\.(\d{2})\.(\d{2,4})", found_date)
-        if m_date:
-            dd, mm, yy = m_date.groups()
-            if len(yy) == 2:
-                yy = "20" + yy
-            out["Datum"] = f"{yy}-{mm}-{dd}"
+        if found_date and not out.get("Datum"):
+            m_date = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", found_date)
+            if m_date:
+                dd, mm, yy = m_date.groups()
+                if len(dd) == 1:
+                    dd = "0" + dd
+                if len(yy) == 2:
+                    yy = "20" + yy
+                out["Datum"] = f"{yy}-{mm}-{dd}"
 
-    if found_time:
-        out["Uhrzeit"] = found_time
+        if found_time and not out.get("Uhrzeit"):
+            out["Uhrzeit"] = found_time
 
     # -------------------------
     # Zahlung / Gegeben / Rückgeld
@@ -4584,6 +4647,41 @@ def finalize_and_save_receipt(best: dict, rtype: str, excel_path: str):
         print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
 
     return reviewed
+
+def normalize_tax_fields(best: dict) -> dict:
+    """
+    Sorgt dafür, dass MwSt %, MwSt (€) und Netto (€) konsistent sind.
+    """
+    gross = best.get("Betrag (€)")
+    net = best.get("Netto (€)")
+    vat = best.get("MwSt (€)")
+    rate = best.get("MwSt %")
+
+    try:
+        if isinstance(gross, (int, float)):
+
+            # Wenn MwSt % bekannt → alles daraus ableiten
+            if rate == 7:
+                net_calc = round(gross / 1.07, 2)
+                vat_calc = round(gross - net_calc, 2)
+                best.setdefault("Netto (€)", net_calc)
+                best.setdefault("MwSt (€)", vat_calc)
+
+            elif rate == 19:
+                net_calc = round(gross / 1.19, 2)
+                vat_calc = round(gross - net_calc, 2)
+                best.setdefault("Netto (€)", net_calc)
+                best.setdefault("MwSt (€)", vat_calc)
+
+            # Wenn Netto + MwSt vorhanden → Brutto prüfen
+            elif isinstance(net, (int, float)) and isinstance(vat, (int, float)):
+                if abs((net + vat) - gross) < 0.05:
+                    pass  # alles ok
+
+    except Exception:
+        pass
+
+    return best
 # =========================
 # ENRICHER / NACHSCHÄRFUNG
 # =========================
@@ -4681,57 +4779,97 @@ def apply_enrichers(best: dict, rtype: str | None = None) -> tuple[dict, str]:
 
 def extract_best_datetime(text: str) -> tuple[str | None, str | None]:
     """
-    Extrahiert ein plausibles Datum + Uhrzeit aus OCR-Text.
-    Akzeptiert z. B.:
-    - 27.02.26 07:55
-    - 27,02,26 07:55
-    - 7.02.2607:55
-    - 05.03.2026 16:38 Uhr
+    Extrahiert ein plausibles Bon-Datum + Uhrzeit aus OCR-Text.
+    Bevorzugt echte Bon-Zeilen und vermeidet TSE-/Start-/Endzeiten.
     """
     import re
 
     if not text:
         return None, None
 
-    candidates = re.findall(
-        r"\b(\d{1,2}[.,]\d{2}[.,]\d{2,4})\s*(\d{2}:\d{2})\b",
-        text
-    )
+    candidates = []
 
-    found = []
+    lines = text.splitlines()
 
-    for raw_date, raw_time in candidates:
-        try:
-            hh, mi = map(int, raw_time.split(":"))
-            if hh > 23 or mi > 59:
-                continue
+    for idx, line in enumerate(lines):
+        low = line.lower()
 
-            raw_date = raw_date.replace(",", ".")
-            md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
-            if not md:
-                continue
-
-            dd, mm, yy = md.groups()
-            if len(dd) == 1:
-                dd = "0" + dd
-            if len(yy) == 2:
-                yy = "20" + yy
-
-            # einfache Plausibilität
-            dd_i = int(dd)
-            mm_i = int(mm)
-            if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
-                continue
-
-            found.append((f"{yy}-{mm}-{dd}", raw_time))
-        except Exception:
+        # harte Ausschlüsse
+        if any(k in low for k in [
+            "startzeitpunkt",
+            "beendigungszeitpunkt",
+            "signatur",
+            "signaturzähler",
+            "signaturzahler",
+            "prüfwert",
+            "prufwert",
+            "seriennr. tse",
+            "tse information",
+        ]):
             continue
 
-    if not found:
+        for m in re.finditer(
+            r"\b(\d{1,2}[.,]\d{2}[.,]\d{2,4})\s*(\d{2}:\d{2})\b",
+            line
+        ):
+            raw_date, raw_time = m.groups()
+
+            try:
+                hh, mi = map(int, raw_time.split(":"))
+                if hh > 23 or mi > 59:
+                    continue
+
+                raw_date = raw_date.replace(",", ".")
+                md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
+                if not md:
+                    continue
+
+                dd, mm, yy = md.groups()
+                if len(dd) == 1:
+                    dd = "0" + dd
+                if len(yy) == 2:
+                    yy = "20" + yy
+
+                if not (1 <= int(dd) <= 31 and 1 <= int(mm) <= 12):
+                    continue
+
+                score = 0
+
+                # Bon-nahe Hinweise bevorzugen
+                context = " ".join(lines[max(0, idx - 3):idx + 4]).lower()
+                if "datum" in context:
+                    score += 5
+                if "uhr" in line.lower() or "uhrzeit" in context:
+                    score += 5
+                if "bon" in context:
+                    score += 2
+                if "kasse" in context or "filiale" in context:
+                    score += 2
+
+                # TSE-/Technik-Kontext abwerten
+                if any(k in context for k in [
+                    "tse",
+                    "startzeitpunkt",
+                    "beendigungszeitpunkt",
+                    "signatur",
+                    "prüfwert",
+                    "prufwert",
+                ]):
+                    score -= 10
+
+                candidates.append((score, idx, f"{yy}-{mm}-{dd}", raw_time))
+
+            except Exception:
+                continue
+
+    if not candidates:
         return None, None
 
-    # meist steht das relevante Bon-Datum eher weit unten → letzten plausiblen Treffer nehmen
-    return found[-1]
+    # höchster Score gewinnt; bei Gleichstand späterer Bonbereich
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, _, date_str, time_str = candidates[-1]
+
+    return date_str, time_str
 
 def fix_truncated_day(date_str: str | None, raw: str) -> str | None:
     """
@@ -4775,6 +4913,155 @@ def fix_truncated_day(date_str: str | None, raw: str) -> str | None:
         pass
 
     return date_str
+
+def ocr_result_looks_suspicious(best: dict) -> bool:
+    laden = str(best.get("Laden") or "").strip()
+    betrag = best.get("Betrag (€)")
+    belegtyp = best.get("Belegtyp")
+
+    # Harte Fehler
+    if not isinstance(betrag, (int, float)) or betrag <= 0:
+        return True
+
+    if not laden or len(laden) < 4:
+        return True
+
+    # offensichtlicher OCR-Müll beim Laden
+    letters = sum(ch.isalpha() for ch in laden)
+    if letters < 3:
+        return True
+
+    # Fuel besonders streng prüfen
+    if belegtyp == "fuel":
+        if betrag < 20:
+            return True
+        if any(ch.isdigit() for ch in laden):
+            return True
+
+    # Bei normalen Retail/Grocery-Bons reicht Laden + Betrag erstmal.
+    # Datum/Uhrzeit werden später stabilisiert.
+    return False
+
+def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
+    import re
+
+    combined_text = "\n".join(texts)
+    combo_text = safe_post_ocr_cleanup(combined_text)
+
+    best["Rohtext"] = combined_text
+
+    if not best.get("Belegtyp"):
+        txt_up = combined_text.upper()
+
+        if re.search(r"\b(HAGEBAU|OBI|BAUHAUS|HORNBACH)\b", txt_up):
+            best["Belegtyp"] = "retail"
+        elif re.search(r"\b(BÄCKEREI|BACKHAUS|BACKSTUBE|KONDITOREI)\b", txt_up):
+            best["Belegtyp"] = "retail"
+        elif re.search(r"\b(LIDL|ALDI|EDEKA|REWE|NORMA|NETTO|PENNY|KAUFLAND)\b", txt_up):
+            best["Belegtyp"] = "grocery"
+        elif re.search(r"\b(APOTHEKE)\b", txt_up):
+            best["Belegtyp"] = "pharmacy"
+        elif re.search(r"\b(ARAL|SHELL|JET|ESSO|TOTAL|BFT)\b", txt_up):
+            best["Belegtyp"] = "fuel"
+        else:
+            best["Belegtyp"] = "generic"
+
+    clean_head = "\n".join([ln for ln in combo_text.splitlines() if ln.strip()][:20])
+    best["Laden"] = _sanitize_store_name(best.get("Laden"), clean_head) or best.get("Laden")
+
+    forced = coerce_type_by_store(best.get("Laden") or "")
+    if forced and (not best.get("Belegtyp") or best.get("Belegtyp") == "generic"):
+        best["Belegtyp"] = forced
+
+    if not best.get("Zahlung"):
+        best["Zahlung"] = ""
+
+    if best.get("Betrag (€)") in (0, 0.0, "0", "0,00"):
+        best.pop("Betrag (€)", None)
+
+    if best.get("Betrag (€)"):
+        best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
+
+    best["Belegtyp"] = refine_receipt_type_from_text(
+        best.get("Rohtext", ""),
+        best.get("Belegtyp", "generic")
+    )
+
+    best, rtype = apply_enrichers(best, best.get("Belegtyp"))
+    best = normalize_tax_fields(best)
+    best = infer_vat_rate_from_amounts(best)
+
+    raw = best.get("Rohtext", "") or ""
+    raw = best.get("Rohtext", "") or "\n".join(texts)
+    txt_up = raw.upper()
+    txt_up = raw.upper()
+
+    if re.search(r"\bLIDL\b", txt_up):
+        best["Laden"] = "LIDL"
+    elif re.search(r"\bKAUFLAND\b", txt_up):
+        best["Laden"] = "KAUFLAND"
+
+    return best, best.get("Belegtyp", "generic")
+
+def fill_missing_date_from_existing_time(best: dict, texts: list[str]) -> dict:
+    import re
+
+    if best.get("Datum") or not best.get("Uhrzeit"):
+        return best
+
+    raw = (best.get("Rohtext", "") or "") + "\n" + "\n".join(texts or [])
+    time_hint = re.escape(str(best.get("Uhrzeit")))
+
+    bad_words = [
+        "startzeitpunkt", "beendigungszeitpunkt", "signatur",
+        "signaturzähler", "signaturzahler", "tse",
+        "prüfwert", "prufwert"
+    ]
+
+    def norm_date(raw_date: str):
+        raw_date = raw_date.replace(",", ".")
+        raw_date = re.sub(r"\s+", "", raw_date)
+        md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
+        if not md:
+            return None
+        dd, mm, yy = md.groups()
+        if len(dd) == 1:
+            dd = "0" + dd
+        if len(yy) == 2:
+            yy = "20" + yy
+        return f"{yy}-{mm}-{dd}"
+
+    # 1) Suche Datum in einem Textfenster rund um die bekannte Uhrzeit
+    for m_time in re.finditer(time_hint, raw):
+        start = max(0, m_time.start() - 120)
+        end = min(len(raw), m_time.end() + 120)
+        window = raw[start:end]
+        low = window.lower()
+
+        if any(k in low for k in bad_words):
+            continue
+
+        m_date = re.search(r"\b(\d{1,2}[.,]\d{2}[.,]\s*\d{2,4})\b", window)
+        if m_date:
+            d = norm_date(m_date.group(1))
+            if d:
+                best["Datum"] = d
+                return best
+
+    # 2) Fallback: erstes plausibles Nicht-TSE-Datum im ganzen Text
+    for ln in raw.splitlines():
+        low = ln.lower()
+        if any(k in low for k in bad_words):
+            continue
+
+        m_date = re.search(r"\b(\d{1,2}[.,]\d{2}[.,]\s*\d{2,4})\b", ln)
+        if m_date:
+            d = norm_date(m_date.group(1))
+            if d:
+                best["Datum"] = d
+                return best
+    return best
+
 # =========================
 # HAUPTABLÄUFE / SCAN
 # =========================
@@ -4814,21 +5101,32 @@ def scan_kassenbon(
         # OCR + Parsing
         # =========================
         if USE_PADDLE:
-            lines = run_paddle_ocr(image_path)
+            # 1. schneller erster Versuch
+            lines = run_paddle_ocr(image_path, max_side=3200)
             texts = [ln["text"] for ln in lines]
             combined_text = "\n".join(texts)
-
             best = parse_receipt_blocks(lines)
 
-            #print("\n=== DEBUG PADDLE RAW ===")
-            #print(best)
+            best = parse_receipt_blocks(lines)
 
             if not best:
                 print("❗ PaddleOCR lieferte kein Ergebnis.")
                 return None
 
-            best["Rohtext"] = combined_text
+            best, rtype = stabilize_scanned_result(best, texts)
 
+            if ocr_result_looks_suspicious(best):
+                print(f"⚠️ OCR unsicher ({best.get('Laden', '?')} / {best.get('Betrag (€)', '?')}) → Retry")
+                lines_hi = run_paddle_ocr(image_path, max_side=4000)
+                texts_hi = [ln["text"] for ln in lines_hi]
+                best_hi = parse_receipt_blocks(lines_hi)
+
+                if best_hi:
+                    best_hi, rtype_hi = stabilize_scanned_result(best_hi, texts_hi)
+                    lines = lines_hi
+                    texts = texts_hi
+                    best = best_hi
+                    rtype = rtype_hi
             # Belegtyp nur ergänzen, nicht überschreiben
             if not best.get("Belegtyp"):
                 txt_up = combined_text.upper()
@@ -4900,49 +5198,6 @@ def scan_kassenbon(
         for ln in combo_text.splitlines()[-40:]:
             print(ln)
 
-    # Laden nur säubern, nicht hart überschreiben
-    clean_head = "\n".join([ln for ln in combo_text.splitlines() if ln.strip()][:20])
-    best["Laden"] = _sanitize_store_name(best.get("Laden"), clean_head) or best.get("Laden")
-
-    # Store-basierten Typ nur ergänzen, nicht blind überschreiben
-    forced = coerce_type_by_store(best.get("Laden") or "")
-    if forced and (not best.get("Belegtyp") or best.get("Belegtyp") == "generic"):
-        best["Belegtyp"] = forced
-        rtype = forced
-
-    # Keine unbekannte Zahlung erzwingen
-    if not best.get("Zahlung"):
-        best["Zahlung"] = ""
-
-    # 0-Beträge verwerfen
-    if best.get("Betrag (€)") in (0, 0.0, "0", "0,00"):
-        best.pop("Betrag (€)", None)
-
-    # Sanitizer nur auf vorhandene Beträge anwenden
-    if best.get("Betrag (€)"):
-        best["Betrag (€)"] = _sanitize_total(best["Betrag (€)"], combo_text)
-
-    # Typ nach Rohtext nachschärfen
-    best["Belegtyp"] = refine_receipt_type_from_text(
-        best.get("Rohtext", ""),
-        best.get("Belegtyp", "generic")
-    )
-
-    #print("\n=== DEBUG VOR STATUS ===")
-    #print(best)
-
-    best, rtype = apply_enrichers(best, best.get("Belegtyp"))
-    best = normalize_tax_fields(best)
-
-    # Letzte Stabilisierung vor dem Speichern
-    raw = best.get("Rohtext", "") or ""
-    txt_up = raw.upper()
-
-    if re.search(r"\bLIDL\b", txt_up):
-        best["Laden"] = "LIDL"
-    elif re.search(r"\bKAUFLAND\b", txt_up):
-        best["Laden"] = "KAUFLAND"
-
     # 2) Unplausible Uhrzeit verwerfen
     t = best.get("Uhrzeit")
     if t:
@@ -4953,6 +5208,7 @@ def scan_kassenbon(
                 best["Datum"] = None
                 best["Uhrzeit"] = None
 
+    raw = best.get("Rohtext", "") or "\n".join(texts)
     # 3) Datum/Uhrzeit robust neu ziehen
     if not best.get("Datum") or not best.get("Uhrzeit"):
         dt_date, dt_time = extract_best_datetime(raw)
@@ -4961,16 +5217,52 @@ def scan_kassenbon(
             best["Datum"] = dt_date
             best["Uhrzeit"] = dt_time
 
-    # 4) Korrektur: führende Ziffer beim Tag fehlt (z. B. 7 statt 27)
+    # 4) Falls nur Datum fehlt, Datum passend zur vorhandenen Uhrzeit suchen
+    if not best.get("Datum") and best.get("Uhrzeit"):
+        raw = best.get("Rohtext", "") or "\n".join(texts)
+        time_hint = re.escape(str(best.get("Uhrzeit")))
+
+        m_date = re.search(
+            rf"\b(\d{{1,2}}[.,]\d{{2}}[.,]\d{{2,4}})\s*{time_hint}\b",
+            raw
+        )
+
+        if not m_date:
+            for ln in raw.splitlines():
+                low = ln.lower()
+                if any(k in low for k in [
+                    "startzeitpunkt",
+                    "beendigungszeitpunkt",
+                    "signatur",
+                    "tse",
+                    "prüfwert",
+                    "prufwert",
+                ]):
+                    continue
+
+                m_date = re.search(r"\b(\d{1,2}[.,]\d{2}[.,]\s*\d{2,4})\b", ln)
+                if m_date:
+                    break
+
+        if m_date:
+            raw_date = m_date.group(1).replace(",", ".")
+            md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", raw_date)
+            if md:
+                dd, mm, yy = md.groups()
+                if len(dd) == 1:
+                    dd = "0" + dd
+                if len(yy) == 2:
+                    yy = "20" + yy
+                best["Datum"] = f"{yy}-{mm}-{dd}"
+
+    # 5) Korrektur: führende Ziffer beim Tag fehlt (z. B. 7 statt 27)
     try:
         datum = best.get("Datum")
         if datum:
             yy, mm, dd = datum.split("-")
             dd_int = int(dd)
 
-            # nur wenn Tag sehr klein ist → typischer OCR-Verlust
             if dd_int < 10:
-                # im Rohtext nach zweistelligem Datum suchen
                 m2 = re.search(rf"\b(\d{{2}})[.,]{mm}[.,]{yy[-2:]}", raw)
                 if m2:
                     dd2 = int(m2.group(1))
@@ -4979,6 +5271,7 @@ def scan_kassenbon(
     except Exception:
         pass
 
+    best = fill_missing_date_from_existing_time(best, texts)
     return finalize_and_save_receipt(best, rtype, excel_path)
 
 def scan_kassenbon_group(
@@ -5535,8 +5828,7 @@ def scan_pdf_receipt(
 
         best, rtype = apply_enrichers(best, rtype)
         best = normalize_tax_fields(best)
-        #print("\n=== DEBUG VOR STATUS 5 ===")
-        #print(best)
+        best = infer_vat_rate_from_amounts(best)
         return finalize_and_save_receipt(best, rtype, excel_path)
 
     except Exception as e:
