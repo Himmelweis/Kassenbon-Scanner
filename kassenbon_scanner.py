@@ -43,7 +43,7 @@ DEBUG_OCR_TYPES = False   # zeigt "DEBUG ocr_text_multi types: [...]"
 DEBUG_PAYMENTS  = True   # zeigt "💳 Zahlungsart ..." Debug-Ausgaben
 DEBUG_PRINTS = False  # global
 DEBUG = False
-DEBUG_HEAD = False
+DEBUG_HEAD = True
 DEBUG_OCR_TIMING = False
 DEBUG_FOOTER = False
 DEBUG_ALL = False
@@ -2308,21 +2308,27 @@ def _dedupe_append(df: pd.DataFrame, row: dict, key_cols: list[str]) -> pd.DataF
 # =========================
 
 def build_receipt_signature(d: dict) -> str:
+    import re
+
     def norm_text(x):
-        return str(x or "").strip().lower()
+        s = str(x or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[^a-z0-9äöüß ]", "", s)
+        return s
 
     def norm_amount(x):
-        if isinstance(x, (int, float)):
-            return f"{x:.2f}"
-        return norm_text(x)
+        try:
+            return f"{float(x):.2f}"
+        except Exception:
+            return norm_text(x)
 
-    parts = [
-        norm_text(d.get("Datum")),
-        norm_text(d.get("Uhrzeit")),
-        norm_text(d.get("Laden")),
-        norm_amount(d.get("Betrag (€)")),
-    ]
-    return "|".join(parts)
+    datum = norm_text(d.get("Datum"))
+    uhrzeit = norm_text(d.get("Uhrzeit"))
+    laden = norm_text(d.get("Laden"))
+    betrag = norm_amount(d.get("Betrag (€)"))
+    typ = norm_text(d.get("Belegtyp"))
+
+    return "|".join([datum, uhrzeit, laden, betrag, typ])
 
 def is_duplicate_receipt(d: dict, excel_path: str) -> bool:
     import os
@@ -2340,7 +2346,7 @@ def is_duplicate_receipt(d: dict, excel_path: str) -> bool:
         headers = [cell.value for cell in ws[1]]
         col_map = {name: idx + 1 for idx, name in enumerate(headers) if name}
 
-        needed = ["Datum", "Uhrzeit", "Laden", "Betrag (€)"]
+        needed = ["Datum", "Uhrzeit", "Laden", "Betrag (€)", "Belegtyp"]
         if not all(k in col_map for k in needed):
             return False
 
@@ -2350,6 +2356,7 @@ def is_duplicate_receipt(d: dict, excel_path: str) -> bool:
                 "Uhrzeit": ws.cell(row=row, column=col_map["Uhrzeit"]).value,
                 "Laden": ws.cell(row=row, column=col_map["Laden"]).value,
                 "Betrag (€)": ws.cell(row=row, column=col_map["Betrag (€)"]).value,
+                "Belegtyp": ws.cell(row=row, column=col_map["Belegtyp"]).value,
             }
             sig_old = build_receipt_signature(existing)
             if sig_old == sig_new:
@@ -2516,10 +2523,6 @@ def run_paddle_ocr(image_path: str, max_side: int = 3200) -> list[dict]:
     return lines
 
 def infer_vat_rate_from_amounts(best: dict) -> dict:
-    """
-    Ergänzt MwSt %, wenn Brutto/Netto/MwSt plausibel vorliegen,
-    aber kein Satz gesetzt ist.
-    """
     gross = best.get("Betrag (€)")
     net = best.get("Netto (€)")
     vat = best.get("MwSt (€)")
@@ -2528,21 +2531,27 @@ def infer_vat_rate_from_amounts(best: dict) -> dict:
     if rate in (7, 19):
         return best
 
-    if not all(isinstance(x, (int, float)) for x in (gross, net, vat)):
-        return best
+    if isinstance(gross, (int, float)) and isinstance(net, (int, float)) and gross > net > 0:
+        diff = round(gross - net, 2)
+        inferred = round((diff / net) * 100, 2)
 
-    if abs((net + vat) - gross) > 0.06:
-        return best
+        if 18.0 <= inferred <= 20.0:
+            best["MwSt %"] = 19
+            best["MwSt (€)"] = diff
+            return best
 
-    try:
-        inferred = round((vat / net) * 100, 2)
-    except Exception:
-        return best
+        if 6.5 <= inferred <= 7.5:
+            best["MwSt %"] = 7
+            best["MwSt (€)"] = diff
+            return best
 
-    if 6.5 <= inferred <= 7.5:
-        best["MwSt %"] = 7
-    elif 18.0 <= inferred <= 20.0:
-        best["MwSt %"] = 19
+    if all(isinstance(x, (int, float)) for x in (gross, net, vat)):
+        if abs((net + vat) - gross) <= 0.10:
+            inferred = round((vat / net) * 100, 2)
+            if 6.5 <= inferred <= 7.5:
+                best["MwSt %"] = 7
+            elif 18.0 <= inferred <= 20.0:
+                best["MwSt %"] = 19
 
     return best
 
@@ -4743,6 +4752,18 @@ def enrich_fuel_data(best: dict):
     except Exception:
         pass
 
+    # 4) Fuel-Laden aus Tankstellen-/Mail-/Standort-Hinweisen korrigieren
+    try:
+        raw_up = raw.upper()
+
+        if "TANKSTELLE-BRETTEN" in raw_up or "TANKSTELLE BRETTEN" in raw_up:
+            best["Laden"] = "ZG Tankstelle Bretten"
+        elif "HONECK-WALDSCHUETZ" in raw_up or "HONECK-WALDSCHÜTZ" in raw_up:
+            if not best.get("Laden") or any(ch.isdigit() for ch in str(best.get("Laden"))):
+                best["Laden"] = "Honeck-Waldschütz Energie"
+    except Exception:
+        pass
+
     return best
 
 def enrich_grocery_data(best: dict):
@@ -4755,6 +4776,18 @@ def enrich_grocery_data(best: dict):
         if matches:
             vals = [float(x.replace(",", ".")) for x in matches]
             best["Betrag (€)"] = max(vals)
+
+    # Kaufland/Lidl: Summe bevorzugen, nicht Steuer-/Artikelwerte
+    try:
+        if "KAUFLAND" in raw.upper() or "LIDL" in raw.upper():
+            m = re.search(
+                r"(?is)\bSUMME\b[^\d]{0,30}(\d{1,4}[.,]\d{2})\s*(?:EUR|EURO|EURURO)?",
+                raw
+            )
+            if m:
+                best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+    except Exception:
+        pass
 
     return best
 
@@ -4805,6 +4838,7 @@ def extract_best_datetime(text: str) -> tuple[str | None, str | None]:
             "prufwert",
             "seriennr. tse",
             "tse information",
+            "start/ende",
         ]):
             continue
 
