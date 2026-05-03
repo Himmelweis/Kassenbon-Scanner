@@ -94,7 +94,7 @@ STRICT_TOTAL = True  # ganz oben
 
 COLUMNS = [
     "Datum","Uhrzeit","Laden","Liter","€/L","Betrag (€)","Gegeben (€)","Wechselgeld (€)",
-    "MwSt %","MwSt (€)","Netto (€)","Säule","Kassierer","Beleg-Nr.",
+    "Pfand (€)","MwSt %","MwSt (€)","Netto (€)","Säule","Kassierer","Beleg-Nr.",
     "Confidence","Prüfstatus","Rohtext"
 ]
 
@@ -102,7 +102,7 @@ COLUMNS = [
 MASTER_COLUMNS = [
     "Datum","Uhrzeit","Laden",
     "Betrag (€)","Gegeben (€)","Wechselgeld (€)",
-    "MwSt %","MwSt (€)","Netto (€)","Zahlung",
+    "Pfand (€)","MwSt %","MwSt (€)","Netto (€)","Zahlung",
     "Belegtyp",  # Typ immer vor Prüfstatus
     "Prüfstatus" # << immer letzte Spalte
 ]
@@ -4786,6 +4786,71 @@ def enrich_grocery_data(best: dict):
             )
             if m:
                 best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+    except Exception:
+        pass
+
+    # Gegeben / Rückgeld erkennen
+    try:
+        raw_up = raw.upper()
+
+        # Rückgeld
+        m_change = re.search(
+            r"(?is)\b(RÜCKGELD|RUECKGELD)\b[^\d]{0,30}(\d{1,4}[.,]\d{2})",
+            raw
+        )
+        if m_change:
+            best["Wechselgeld (€)"] = float(m_change.group(2).replace(",", "."))
+
+        # Gegeben: größte plausible Zahl vor "Rückgeld"
+        if best.get("Wechselgeld (€)") and isinstance(best.get("Betrag (€)"), (int, float)):
+            before_change = re.split(r"(?i)RÜCKGELD|RUECKGELD", raw)[0]
+
+            vals = []
+            for m in re.finditer(r"(\d{1,4}[.,]\d{2})\s*(?:EUR|EURO)?", before_change):
+                try:
+                    val = float(m.group(1).replace(",", "."))
+                    if val > best["Betrag (€)"]:
+                        vals.append(val)
+                except Exception:
+                    pass
+
+            if vals:
+                best["Gegeben (€)"] = max(vals)
+
+    except Exception:
+        pass
+
+    # Pfand erkennen: bevorzugt Muster wie "2 * 1,50" nach Pfandartikel
+    try:
+        pfand_vals = []
+        raw_lines = raw.splitlines()
+
+        for i, ln in enumerate(raw_lines):
+            if "PFAND" not in ln.upper():
+                continue
+
+            window = "\n".join(raw_lines[i:i + 5])
+
+            # Menge * Einzelpfand, z. B. "2 * 1,50"
+            m_mul = re.search(r"\b(\d{1,3})\s*\*\s*(\d{1,2}[.,]\d{2})\b", window)
+            if m_mul:
+                qty = int(m_mul.group(1))
+                unit = float(m_mul.group(2).replace(",", "."))
+
+                # typische Pfandwerte, verhindert Artikelpreise wie 9,54
+                if unit in (0.08, 0.15, 0.25, 1.50):
+                    pfand_vals.append(round(qty * unit, 2))
+
+                continue
+
+            # Fallback nur für Zeilen, die selbst Pfand + Betrag enthalten
+            m_same_line = re.search(r"PFAND[^\d]{0,20}(\d{1,3}[.,]\d{2})", ln, re.I)
+            if m_same_line:
+                pfand_vals.append(float(m_same_line.group(1).replace(",", ".")))
+
+        if pfand_vals:
+            best["Pfand (€)"] = round(sum(pfand_vals), 2)
+
     except Exception:
         pass
 
