@@ -114,6 +114,7 @@ EXTRA_BY_TYPE = {
     "pharmacy":    ["Rezeptpflichtig","Zuzahlung (€)","Netto 7% (€)","MwSt 7% (€)","Netto 19% (€)","MwSt 19% (€)"],
     "restaurant":  ["Tisch","Bedienung","Trinkgeld (€)","Netto 7% (€)","MwSt 7% (€)","Netto 19% (€)","MwSt 19% (€)"],
     "retail":      ["Artikelanzahl","Netto 7% (€)","MwSt 7% (€)","Netto 19% (€)","MwSt 19% (€)"],
+    "card_receipt": ["Beleg-Nr", "TA-Nr"],
     "generic":     [],  # Fallback
 }
 
@@ -125,6 +126,7 @@ SHEET_BY_TYPE = {
     "restaurant": "Restaurant",
     "retail": "Einzelhandel",
     "generic": "Einzelhandel",
+    "card_receipt": "Kartenzahlung",
 }
 
 def _columns_for_type(rtype: str) -> list[str]:
@@ -5099,6 +5101,26 @@ def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
         best["Laden"] = "LIDL"
     elif re.search(r"\bKAUFLAND\b", txt_up):
         best["Laden"] = "KAUFLAND"
+
+    # Kartenbeleg: Händler steht oft nach "K-U-N-D-E-N B-ELEG"
+    try:
+        raw_lines = [ln.strip() for ln in combo_text.splitlines() if ln.strip()]
+        raw_up = combo_text.upper()
+
+        if "K-U-N-D-E-N B-ELEG" in raw_up or "KUNDENBELEG" in raw_up:
+            for i, ln in enumerate(raw_lines):
+                if "K-U-N-D-E-N" in ln.upper() or "KUNDENBELEG" in ln.upper():
+                    if i + 1 < len(raw_lines):
+                        candidate = raw_lines[i + 1].strip()
+
+                        if len(candidate) >= 3 and not any(x in candidate.upper() for x in [
+                            "KARTENZAHLUNG", "GIROCARD", "BETRAG", "T-ID"
+                        ]):
+                            best["Laden"] = candidate
+                            best["Belegtyp"] = "card_receipt"
+                    break
+    except Exception:
+        pass
 
     return best, best.get("Belegtyp", "generic")
 
