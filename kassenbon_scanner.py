@@ -104,6 +104,7 @@ MASTER_COLUMNS = [
     "Betrag (€)","Gegeben (€)","Wechselgeld (€)",
     "Pfand (€)","MwSt %","MwSt (€)","Netto (€)","Zahlung",
     "Belegtyp",  # Typ immer vor Prüfstatus
+    "Kategorie",
     "Prüfstatus" # << immer letzte Spalte
 ]
 
@@ -2259,6 +2260,8 @@ def append_to_excel(row_dict, excel_path=EXCEL_PATH, sheet="Bons"):
     # 3) neue Zeile in fester Spaltenreihenfolge
     row = {c: row_dict.get(c) for c in COLUMNS}
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    best["Kategorie"] = infer_category(best)
 
     # 4) speichern
     with pd.ExcelWriter(excel_path, engine="openpyxl", mode="w") as w:
@@ -4624,6 +4627,9 @@ def _status_from(best: dict) -> str:
     if best.get("Belegtyp") == "fuel" and mwst not in (7, 19):
         reasons.append("MwSt fehlt (Fuel)")
 
+    if best.get("Wechselgeld (€)") == 0:
+        best["Wechselgeld (€)"] = ""
+
     # Ergebnis
     if not reasons:
         return "OK"
@@ -4693,6 +4699,47 @@ def normalize_tax_fields(best: dict) -> dict:
         pass
 
     return best
+
+def infer_category(best: dict) -> str:
+    import re
+
+    store = str(best.get("Laden") or "").upper()
+    rtype = str(best.get("Belegtyp") or "").lower()
+
+    if rtype == "fuel":
+        return "Tanken"
+
+    if rtype == "grocery":
+        return "Lebensmittel"
+
+    if rtype == "pharmacy":
+        return "Apotheke"
+
+    if rtype == "card_receipt":
+        # einfache Café-/Restaurant-Heuristik
+        if any(x in store for x in [
+            "CAFE", "CAFÉ", "ESPRESSO", "BAR",
+            "RISTORANTE", "PIZZA", "BURGER"
+        ]):
+            return "Restaurant"
+
+        return "Kartenzahlung"
+
+    if rtype == "retail":
+        if any(x in store for x in [
+            "HAGEBAU", "OBI", "BAUHAUS", "HORNBACH"
+        ]):
+            return "Baumarkt"
+
+        if any(x in store for x in [
+            "BÄCKEREI", "BACK", "KONDITOREI"
+        ]):
+            return "Bäckerei"
+
+        return "Einzelhandel"
+
+    return "Sonstiges"
+
 # =========================
 # ENRICHER / NACHSCHÄRFUNG
 # =========================
@@ -5043,6 +5090,28 @@ def ocr_result_looks_suspicious(best: dict) -> bool:
     # Datum/Uhrzeit werden später stabilisiert.
     return False
 
+def looks_like_card_store_name(s: str) -> bool:
+    s = str(s or "").strip()
+    up = s.upper()
+
+    if len(s) < 3:
+        return False
+
+    # typische Nicht-Händler-Zeilen
+    if any(x in up for x in [
+        "KARTENZAHLUNG", "GIROCARD", "BETRAG", "T-ID",
+        "TA-NR", "BELEG-NR", "ONLINE", "KONTAKTLOS",
+        "CHIP", "AUTORISIERUNG", "EMV", "EUR",
+        "TEL", "FAX", "STRASSE", "STRAßE", "PLZ"
+    ]):
+        return False
+
+    # reine Zahlen/IDs ablehnen
+    if not any(ch.isalpha() for ch in s):
+        return False
+
+    return True
+
 def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
     import re
 
@@ -5092,6 +5161,8 @@ def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
     best = normalize_tax_fields(best)
     best = infer_vat_rate_from_amounts(best)
 
+    best["Kategorie"] = infer_category(best)
+
     raw = best.get("Rohtext", "") or ""
     raw = best.get("Rohtext", "") or "\n".join(texts)
     txt_up = raw.upper()
@@ -5102,7 +5173,7 @@ def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
     elif re.search(r"\bKAUFLAND\b", txt_up):
         best["Laden"] = "KAUFLAND"
 
-    # Kartenbeleg: Händler steht oft nach "K-U-N-D-E-N B-ELEG"
+    # Kartenbeleg: Händler steht oft kurz nach "K-U-N-D-E-N B-ELEG"
     try:
         raw_lines = [ln.strip() for ln in combo_text.splitlines() if ln.strip()]
         raw_up = combo_text.upper()
@@ -5110,14 +5181,16 @@ def stabilize_scanned_result(best: dict, texts: list[str]) -> tuple[dict, str]:
         if "K-U-N-D-E-N B-ELEG" in raw_up or "KUNDENBELEG" in raw_up:
             for i, ln in enumerate(raw_lines):
                 if "K-U-N-D-E-N" in ln.upper() or "KUNDENBELEG" in ln.upper():
-                    if i + 1 < len(raw_lines):
-                        candidate = raw_lines[i + 1].strip()
 
-                        if len(candidate) >= 3 and not any(x in candidate.upper() for x in [
-                            "KARTENZAHLUNG", "GIROCARD", "BETRAG", "T-ID"
-                        ]):
+                    # nicht blind nächste Zeile nehmen, sondern die nächsten paar Zeilen prüfen
+                    for j in range(i + 1, min(i + 5, len(raw_lines))):
+                        candidate = raw_lines[j].strip()
+
+                        if looks_like_card_store_name(candidate):
                             best["Laden"] = candidate
                             best["Belegtyp"] = "card_receipt"
+                            break
+
                     break
     except Exception:
         pass
@@ -5950,6 +6023,7 @@ def scan_pdf_receipt(
         best, rtype = apply_enrichers(best, rtype)
         best = normalize_tax_fields(best)
         best = infer_vat_rate_from_amounts(best)
+        best["Kategorie"] = infer_category(best)
         return finalize_and_save_receipt(best, rtype, excel_path)
 
     except Exception as e:
