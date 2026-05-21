@@ -1,20 +1,32 @@
 import tkinter as tk
+import traceback
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from tkinter import filedialog
 import os
 
 # 👉 deine Funktion importieren
-from kassenbon_scanner import scan_kassenbon
-
+from kassenbon_scanner import scan_kassenbon, scan_pdf_receipt
 
 def handle_files(paths):
     for path in paths:
-        print(f"📄 Verarbeite: {path}")
-        try:
-            scan_kassenbon(path)
-        except Exception as e:
-            print(f"❌ Fehler: {e}")
+        log(f"📄 Verarbeite: {path}")
 
+        try:
+            ext = os.path.splitext(path)[1].lower()
+
+            if ext == ".pdf":
+                result = scan_pdf_receipt(path)
+            else:
+                result = scan_kassenbon(path)
+
+            if result:
+                log("✅ Fertig gespeichert")
+            else:
+                log("❗ Konnte nicht verarbeitet werden")
+
+        except Exception as e:
+            log(f"❌ Fehler: {e}")
+            log(traceback.format_exc())
 
 def open_files():
     files = filedialog.askopenfilenames(
@@ -45,6 +57,15 @@ label.pack(expand=True)
 
 btn = tk.Button(root, text="Dateien auswählen", command=open_files)
 btn.pack(pady=10)
+
+status = tk.Text(root, height=8)
+status.pack(fill="both", padx=10, pady=10)
+
+def log(msg):
+    status.insert("end", msg + "\n")
+    status.see("end")
+    root.update_idletasks()
+
 
 # Drag & Drop aktivieren (Windows)
 try:
