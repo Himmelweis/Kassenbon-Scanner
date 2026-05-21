@@ -49,3 +49,25 @@ test_*/
 backup_*/
 # Lokaler Clone-Ordner ausschließen
 Klon/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+.venv_build/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Logs
+logs/
+
+# Reports
+reports/
+
+# OCR cache
+.paddlex/
