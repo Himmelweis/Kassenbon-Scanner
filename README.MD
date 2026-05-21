@@ -1,6 +1,6 @@
 # Kassenbon Scanner
 
-OCR-basierter Scanner für Kassenbons und Zahlungsbelege.
+OCR-basierter Scanner für Kassenbons, Tankbelege und Kartenbelege mit Excel-Export.
 
 ## Features
 
@@ -20,13 +20,25 @@ pip install -r requirements.txt
 
 python gui.py
 
+```
 Unterstützte Belegtypen
+```
 fuel
 grocery
 retail
 pharmacy
 card_receipt
+
+```
 Bekannte Einschränkungen
+```
 unscharfe Bilder können fehlerhaft sein
 gemischte MwSt wird nicht immer vollständig getrennt
 Kartenbelege enthalten oft keine Artikeldaten
+
+## Start unter Windows
+
+Empfohlen:
+
+```bat
+KassenbonScanner_starten.bat
