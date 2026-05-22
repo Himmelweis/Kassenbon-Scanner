@@ -2339,6 +2339,9 @@ def is_duplicate_receipt(d: dict, excel_path: str) -> bool:
     import os
     from openpyxl import load_workbook
 
+    if not d.get("Datum") or not d.get("Laden") or not d.get("Betrag (€)"):
+        return False
+
     if not os.path.exists(excel_path):
         return False
 
@@ -4653,6 +4656,10 @@ def finalize_and_save_receipt(best: dict, rtype: str, excel_path: str):
 
     reviewed.setdefault("Belegtyp", rtype)
 
+    if not best.get("Datum") and not best.get("Uhrzeit") and not best.get("Laden") and not best.get("Betrag (€)"):
+        print("❗ Ergebnis leer/ungültig – wird nicht gespeichert.")
+        return None
+
     if is_duplicate_receipt(reviewed, excel_path):
         print("⚠️ Duplikat erkannt – nicht erneut gespeichert.")
         return reviewed
@@ -5009,6 +5016,28 @@ def extract_best_datetime(text: str) -> tuple[str | None, str | None]:
 
             except Exception:
                 continue
+
+    # Fallback für OCR-Abstände: "12,05.26 1 1 :05" => "2026-05-12 11:05"
+    if not candidates:
+        compact_text = re.sub(r"\s+", " ", text)
+
+        m = re.search(
+            r"\b(\d{1,2})[.,](\d{2})[.,](\d{2,4})\s+(\d)\s*(\d)\s*:\s*(\d{2})\b",
+            compact_text
+        )
+
+        if m:
+            dd, mm, yy, h1, h2, minute = m.groups()
+            if len(yy) == 2:
+                yy = "20" + yy
+
+            hour = h1 + h2
+
+            try:
+                if 1 <= int(dd) <= 31 and 1 <= int(mm) <= 12 and 0 <= int(hour) <= 23 and 0 <= int(minute) <= 59:
+                    candidates.append((1, 999999, f"{yy}-{mm}-{int(dd):02d}", f"{hour}:{minute}"))
+            except Exception:
+                pass
 
     if not candidates:
         return None, None
@@ -5959,6 +5988,57 @@ def fix_store_from_known_brands(best: dict, txt_up: str) -> dict:
     return best
 
 #===============================================================================
+def render_pdf_pages_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
+    """
+    Rendert PDF-Seiten als temporäre PNG-Dateien.
+    Wird genutzt, wenn ein PDF keinen direkt lesbaren Text enthält.
+    """
+    import os
+    import tempfile
+    import pypdfium2 as pdfium
+
+    image_paths = []
+
+    pdf = pdfium.PdfDocument(pdf_path)
+
+    for i in range(len(pdf)):
+        page = pdf[i]
+        bitmap = page.render(scale=dpi / 72)
+        pil_image = bitmap.to_pil()
+
+        fd, temp_path = tempfile.mkstemp(suffix=f"_page_{i + 1}.png")
+        os.close(fd)
+
+        pil_image.save(temp_path)
+        image_paths.append(temp_path)
+
+    return image_paths
+
+def extract_text_from_pdf_via_ocr(pdf_path: str) -> str:
+    """
+    OCR-Fallback für gescannte PDFs ohne eingebetteten Text.
+    """
+    import os
+
+    image_paths = render_pdf_pages_to_images(pdf_path)
+    all_texts = []
+
+    try:
+        for img_path in image_paths:
+            lines = run_paddle_ocr(img_path, max_side=3200)
+            page_text = "\n".join([ln["text"] for ln in lines])
+            if page_text.strip():
+                all_texts.append(page_text)
+
+    finally:
+        for img_path in image_paths:
+            try:
+                os.remove(img_path)
+            except Exception:
+                pass
+
+    return "\n".join(all_texts)
+
 def scan_pdf_receipt(
     pdf_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -5980,12 +6060,24 @@ def scan_pdf_receipt(
     try:
         # 1) PDF-Text direkt lesen
         pdf_text = extract_text_from_pdf(pdf_path)
-        if not pdf_text:
+
+        if not pdf_text or len(pdf_text.strip()) < 30:
+            print("ℹ️ Kein brauchbarer PDF-Text – OCR-Fallback für Bild-PDF.")
+            pdf_text = extract_text_from_pdf_via_ocr(pdf_path)
+
+        if not pdf_text or len(pdf_text.strip()) < 30:
             print("❗ Kein brauchbarer Text aus PDF erhalten.")
             return None
 
         # 2) Direkt verwenden
         combined_text = pdf_text
+
+        # Testausgabe
+        #print("\n--- PDF OCR CLEAN HEAD ---")
+        #print("\n".join(combined_text.splitlines()[:40]))
+
+        #print("\n--- PDF OCR CLEAN TAIL ---")
+        #print("\n".join(combined_text.splitlines()[-40:]))
 
         # 3) Debug-Ausgaben (analog zu scan_kassenbon)
         if show_debug_footer or debug_print:
@@ -6002,6 +6094,12 @@ def scan_pdf_receipt(
         # PDF direkt mit dem allgemeinen Textparser versuchen
         base = extract_data_from_text_only(combined_text) or {}
         best.update(base)
+
+        dt_date, dt_time = extract_best_datetime(combined_text)
+        if dt_date and dt_time:
+            dt_date = fix_truncated_day(dt_date, combined_text)
+            best["Datum"] = dt_date
+            best["Uhrzeit"] = dt_time
 
         # Fuel-Rechnung gezielt nachschärfen
         if re.search(r"\b(TANKRECHNUNG|TANKSTELLE|SUPER|DIESEL|EUR/L|LITER|KRAFTSTOFF)\b", txt_up):
