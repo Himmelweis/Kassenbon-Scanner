@@ -4820,6 +4820,37 @@ def enrich_fuel_data(best: dict):
     except Exception:
         pass
 
+    # 5) Fuel-Betrag/Netto aus Brutto-/Netto-Zeilen nachziehen
+    try:
+        if not isinstance(best.get("Betrag (€)"), (int, float)):
+            m = re.search(
+                r"(?is)GESAMT\s+BRUTTO[^\d]{0,40}(\d{1,4}[.,]\d{2})\s*(?:EUR)?",
+                raw
+            )
+            if m:
+                best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+
+        if not isinstance(best.get("Netto (€)"), (int, float)):
+            m = re.search(
+                r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*GESA[MN]T\s+NETTO",
+                raw
+            )
+
+            if m:
+                best["Netto (€)"] = float(m.group(1).replace(",", "."))
+
+        # MwSt % robust aus "inkl. 119,00% USt1" ableiten
+        if not best.get("MwSt %"):
+            if re.search(r"(?is)\binkl\.\s*1?19[,.]00\s*%\s*USt", raw):
+                best["MwSt %"] = 19
+
+    except Exception:
+        pass
+
+    if not best.get("Zahlung"):
+        if re.search(r"(?is)\b(STATIONSKARTE|KARTE|GIROCARD|VISA|MASTERCARD)\b", raw):
+            best["Zahlung"] = "Karte"
+
     return best
 
 def enrich_grocery_data(best: dict):
@@ -6039,6 +6070,95 @@ def extract_text_from_pdf_via_ocr(pdf_path: str) -> str:
 
     return "\n".join(all_texts)
 
+def diagnose_pdf_receipt(pdf_path: str):
+    import os
+
+    if not os.path.isfile(pdf_path):
+        print(f"❗ PDF nicht gefunden: {pdf_path}")
+        return None
+
+    print(f"\n🔎 Diagnose PDF: {pdf_path}")
+
+    pdf_text = extract_text_from_pdf(pdf_path)
+
+    if pdf_text_looks_usable(pdf_text):
+        print("📄 Direkt lesbarer PDF-Text gefunden.")
+        text = pdf_text
+    else:
+        print("🖼 Kein brauchbarer PDF-Text – OCR-Fallback.")
+        text = extract_text_from_pdf_via_ocr(pdf_path)
+
+    print("\n--- PDF DIAG HEAD ---")
+    print("\n".join(text.splitlines()[:50]))
+
+    print("\n--- PDF DIAG TAIL ---")
+    print("\n".join(text.splitlines()[-50:]))
+
+    base = extract_data_from_text_only(text) or {}
+
+    dt_date, dt_time = extract_best_datetime(text)
+    if dt_date and dt_time:
+        base["Datum"] = fix_truncated_day(dt_date, text)
+        base["Uhrzeit"] = dt_time
+
+    base["Rohtext"] = text
+    base["Belegtyp"] = refine_receipt_type_from_text(
+        text,
+        base.get("Belegtyp", "generic")
+    )
+    base, rtype = apply_enrichers(base, base.get("Belegtyp"))
+    base = normalize_tax_fields(base)
+    base = infer_vat_rate_from_amounts(base)
+    base["Kategorie"] = infer_category(base)
+
+    print("\n--- PDF DIAG PARSED ---")
+    for k in [
+        "Datum", "Uhrzeit", "Laden", "Betrag (€)",
+        "Gegeben (€)", "Wechselgeld (€)", "Pfand (€)",
+        "MwSt %", "MwSt (€)", "Netto (€)",
+        "Zahlung", "Belegtyp", "Kategorie"
+    ]:
+        print(f"{k}: {base.get(k)}")
+
+    return base
+def pdf_text_looks_usable(text: str) -> bool:
+    """
+    Prüft, ob direkt extrahierter PDF-Text wirklich brauchbar ist.
+    Länge allein reicht nicht, weil OCR-Müll aus PDFs auch lang sein kann.
+    """
+    import re
+
+    if not text or len(text.strip()) < 80:
+        return False
+
+    up = text.upper()
+
+    # starke Hinweise auf echten Belegtext
+    strong_patterns = [
+        r"\bSUMME\b",
+        r"\bTOTAL\b",
+        r"\bDATUM\b",
+        r"\bKAUFLAND\b",
+        r"\bLIDL\b",
+        r"\bREWE\b",
+        r"\bEDEKA\b",
+        r"\bHAGEBAU\b",
+        r"\bTANKSTELLE\b",
+        r"\bGIROCARD\b",
+        r"\bKARTENZAHLUNG\b",
+        r"\bRÜCKGELD\b",
+        r"\bRUECKGELD\b",
+        r"\bEUR\b",
+    ]
+
+    hits = sum(1 for p in strong_patterns if re.search(p, up))
+
+    # außerdem wenigstens eine brauchbare Geld-/Datumsstruktur
+    has_money = re.search(r"\d{1,4}[.,]\d{2}\s*(EUR|€)?", up) is not None
+    has_date = re.search(r"\d{1,2}[.,]\d{1,2}[.,]\d{2,4}", up) is not None
+
+    return hits >= 2 and (has_money or has_date)
+
 def scan_pdf_receipt(
     pdf_path: str,
     excel_path: str = "kassenbons.xlsx",
@@ -6061,11 +6181,11 @@ def scan_pdf_receipt(
         # 1) PDF-Text direkt lesen
         pdf_text = extract_text_from_pdf(pdf_path)
 
-        if not pdf_text or len(pdf_text.strip()) < 30:
+        if not pdf_text_looks_usable(pdf_text):
             print("ℹ️ Kein brauchbarer PDF-Text – OCR-Fallback für Bild-PDF.")
             pdf_text = extract_text_from_pdf_via_ocr(pdf_path)
 
-        if not pdf_text or len(pdf_text.strip()) < 30:
+        if not pdf_text_looks_usable(pdf_text):
             print("❗ Kein brauchbarer Text aus PDF erhalten.")
             return None
 
@@ -6261,6 +6381,7 @@ if __name__ == "__main__":
     MOVE_PROCESSED  = True
     VERBOSE         = True
     SHOW_FOOTER_DBG = False
+    diagnose_pdf_receipt(r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons\_ok\IMG_20260519_0004.pdf")
 
     import os
     if os.path.isdir(TARGET_PATH):
