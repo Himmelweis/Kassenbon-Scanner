@@ -1,9 +1,6 @@
 import time
 import shutil
 from pathlib import Path
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
 from kassenbon_scanner import scan_kassenbon, scan_pdf_receipt
 
 
@@ -51,8 +48,14 @@ def move_safe(src: Path, target_dir: Path):
             target = target_dir / f"{stem}_{counter}{suffix}"
             counter += 1
 
-    shutil.move(str(src), str(target))
+    for attempt in range(10):
+        try:
+            shutil.move(str(src), str(target))
+            return
+        except PermissionError:
+            time.sleep(1)
 
+    raise PermissionError(f"Datei konnte nicht verschoben werden: {src}")
 
 def process_file(path: Path):
     print(f"\n📄 Neue Datei erkannt: {path.name}")
@@ -84,12 +87,10 @@ def process_file(path: Path):
         move_safe(path, ERROR_DIR)
 
 
-class ReceiptHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.is_directory:
-            return
-
-        process_file(Path(event.src_path))
+def process_existing_files():
+    for path in sorted(INPUT_DIR.iterdir()):
+        if path.is_file() and path.suffix.lower() in SUPPORTED:
+            process_file(path)
 
 
 if __name__ == "__main__":
@@ -98,15 +99,24 @@ if __name__ == "__main__":
     print(f"👀 Überwache Ordner: {INPUT_DIR}")
     print("Dateien hier ablegen. Beenden mit STRG+C.")
 
-    observer = Observer()
-    observer.schedule(ReceiptHandler(), str(INPUT_DIR), recursive=False)
-    observer.start()
+    seen = set()
 
     try:
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Beende Überwachung.")
-        observer.stop()
+            for path in sorted(INPUT_DIR.iterdir()):
+                if not path.is_file():
+                    continue
 
-    observer.join()
+                if path.suffix.lower() not in SUPPORTED:
+                    continue
+
+                if path in seen:
+                    continue
+
+                seen.add(path)
+                process_file(path)
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Überwachung beendet.")

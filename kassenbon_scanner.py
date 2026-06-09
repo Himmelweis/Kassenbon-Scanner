@@ -4599,6 +4599,9 @@ def refine_receipt_type_from_text(raw_text: str, current_type: str = "generic") 
     if re.search(r"\b(APOTHEKE|PHARMA|REZEPT)\b", txt):
         return "pharmacy"
 
+    if re.search(r"\bHAGE\w{0,20}", txt):
+        return "retail"
+
     return current_type or "generic"
 
 def _status_from(best: dict) -> str:
@@ -5526,6 +5529,9 @@ def scan_kassenbon(
         pass
 
     best = fill_missing_date_from_existing_time(best, texts)
+    if not best.get("Betrag (€)") or not best.get("Datum") or not best.get("Laden"):
+        print("❗ Ergebnis unvollständig – wird nicht gespeichert.")
+        return None
     return finalize_and_save_receipt(best, rtype, excel_path)
 
 def scan_kassenbon_group(
@@ -6022,26 +6028,50 @@ def fix_store_from_known_brands(best: dict, txt_up: str) -> dict:
 def render_pdf_pages_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     """
     Rendert PDF-Seiten als temporäre PNG-Dateien.
-    Wird genutzt, wenn ein PDF keinen direkt lesbaren Text enthält.
+    Wichtig: PDF/Page/Bitmap sauber freigeben, sonst blockiert Windows die Datei.
     """
     import os
     import tempfile
     import pypdfium2 as pdfium
 
     image_paths = []
+    pdf = None
 
-    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        pdf = pdfium.PdfDocument(pdf_path)
 
-    for i in range(len(pdf)):
-        page = pdf[i]
-        bitmap = page.render(scale=dpi / 72)
-        pil_image = bitmap.to_pil()
+        for i in range(len(pdf)):
+            page = pdf[i]
+            bitmap = page.render(scale=dpi / 72)
+            pil_image = bitmap.to_pil()
 
-        fd, temp_path = tempfile.mkstemp(suffix=f"_page_{i + 1}.png")
-        os.close(fd)
+            fd, temp_path = tempfile.mkstemp(suffix=f"_page_{i + 1}.png")
+            os.close(fd)
 
-        pil_image.save(temp_path)
-        image_paths.append(temp_path)
+            pil_image.save(temp_path)
+            image_paths.append(temp_path)
+
+            try:
+                pil_image.close()
+            except Exception:
+                pass
+
+            try:
+                bitmap.close()
+            except Exception:
+                pass
+
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
 
     return image_paths
 
@@ -6121,10 +6151,11 @@ def diagnose_pdf_receipt(pdf_path: str):
         print(f"{k}: {base.get(k)}")
 
     return base
+
 def pdf_text_looks_usable(text: str) -> bool:
     """
     Prüft, ob direkt extrahierter PDF-Text wirklich brauchbar ist.
-    Länge allein reicht nicht, weil OCR-Müll aus PDFs auch lang sein kann.
+    Wenn nicht, soll der OCR-Fallback auf gerenderte PDF-Seiten laufen.
     """
     import re
 
@@ -6133,31 +6164,21 @@ def pdf_text_looks_usable(text: str) -> bool:
 
     up = text.upper()
 
-    # starke Hinweise auf echten Belegtext
-    strong_patterns = [
-        r"\bSUMME\b",
-        r"\bTOTAL\b",
-        r"\bDATUM\b",
-        r"\bKAUFLAND\b",
-        r"\bLIDL\b",
-        r"\bREWE\b",
-        r"\bEDEKA\b",
-        r"\bHAGEBAU\b",
-        r"\bTANKSTELLE\b",
-        r"\bGIROCARD\b",
-        r"\bKARTENZAHLUNG\b",
-        r"\bRÜCKGELD\b",
-        r"\bRUECKGELD\b",
-        r"\bEUR\b",
-    ]
+    has_money = re.search(r"\b\d{1,4}[.,]\d{2}\s*(EUR|€)?\b", up) is not None
+    has_date = re.search(r"\b\d{1,2}[.,]\d{1,2}[.,]\d{2,4}\b", up) is not None
 
-    hits = sum(1 for p in strong_patterns if re.search(p, up))
+    known_store = any(x in up for x in [
+        "LIDL", "KAUFLAND", "HAGEBAU", "OBI", "BAUHAUS",
+        "HORNBACH", "TANKSTELLE", "BÄCKEREI", "BACKEREI",
+        "DIEFENBACH"
+    ])
 
-    # außerdem wenigstens eine brauchbare Geld-/Datumsstruktur
-    has_money = re.search(r"\d{1,4}[.,]\d{2}\s*(EUR|€)?", up) is not None
-    has_date = re.search(r"\d{1,2}[.,]\d{1,2}[.,]\d{2,4}", up) is not None
+    has_total_word = any(x in up for x in [
+        "SUMME", "TOTAL", "GESAMT", "BRUTTO", "RÜCKGELD", "RUECKGELD"
+    ])
 
-    return hits >= 2 and (has_money or has_date)
+    # Direkt extrahierter PDF-Text ist nur brauchbar, wenn mehrere Kernsignale sauber vorkommen
+    return known_store and has_money and (has_date or has_total_word)
 
 def scan_pdf_receipt(
     pdf_path: str,
@@ -6241,7 +6262,41 @@ def scan_pdf_receipt(
         best, rtype = apply_enrichers(best, rtype)
         best = normalize_tax_fields(best)
         best = infer_vat_rate_from_amounts(best)
+
+        # Hagebau / Baumarkt stabilisieren
+        try:
+            raw = best.get("Rohtext", "") or ""
+            if re.search(r"(?is)\bhage\w{0,30}", raw):
+                best["Laden"] = "hagebaumarkt"
+                best["Belegtyp"] = "retail"
+                rtype = "retail"
+
+                if not best.get("Zahlung"):
+                    if re.search(r"(?is)\b(GIROCARD|KARTENZAHLUNG|EC|VISA|MASTERCARD)\b", raw):
+                        best["Zahlung"] = "Karte"
+
+                if not isinstance(best.get("Betrag (€)"), (int, float)):
+                    m = re.search(
+                        r"(?is)\bSUMME\b.{0,80}?(\d{1,4}[.,]\d{2})\s*(?:EUR|€)?\s*(?:GIROCARD|KARTENZAHLUNG)",
+                        raw
+                    )
+                    if m:
+                        best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+
+                if not isinstance(best.get("Betrag (€)"), (int, float)):
+                    m2 = re.search(r"(?is)\bF[ÜU]R\s+(\d{1,4}[.,]\d{2})\b", raw)
+                    if m2:
+                        best["Betrag (€)"] = float(m2.group(1).replace(",", "."))
+
+        except Exception:
+            pass
+
         best["Kategorie"] = infer_category(best)
+
+        if not best.get("Betrag (€)") or not best.get("Datum") or not best.get("Laden"):
+            print("❗ Ergebnis unvollständig – wird nicht gespeichert.")
+            return None
+
         return finalize_and_save_receipt(best, rtype, excel_path)
 
     except Exception as e:
@@ -6374,33 +6429,36 @@ def batch_scan_folder(folder: str,
 # =========================
 
 if __name__ == "__main__":
-    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons"  # Datei ODER Ordner
-    EXCEL_PATH      = "kassenbons.xlsx"
-    REVIEW_WHEN     = "prüfen"
-    STRICT_TOTAL    = True
-    MOVE_PROCESSED  = True
-    VERBOSE         = True
-    SHOW_FOOTER_DBG = False
-    diagnose_pdf_receipt(r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons\_ok\IMG_20260519_0004.pdf")
+    diagnose_pdf_receipt(
+        r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\_error\Hagebau doppelseite_20260606_0001.pdf"
+    )
+#    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons"  # Datei ODER Ordner
+#    EXCEL_PATH      = "kassenbons.xlsx"
+#    REVIEW_WHEN     = "prüfen"
+#    STRICT_TOTAL    = True
+#    MOVE_PROCESSED  = True
+#    VERBOSE         = True
+#    SHOW_FOOTER_DBG = False
+#    diagnose_pdf_receipt(r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons\_ok\IMG_20260519_0004.pdf")
 
-    import os
-    if os.path.isdir(TARGET_PATH):
-        batch_scan_folder(
-            TARGET_PATH,
-            excel_path=EXCEL_PATH,
-            review_when=REVIEW_WHEN,
-            strict_total=STRICT_TOTAL,
-            move_processed=MOVE_PROCESSED,
-            verbose=VERBOSE,
-        )
-    elif os.path.isfile(TARGET_PATH):
-        print(f"🖼️ Einzeldatei erkannt: {os.path.basename(TARGET_PATH)}")
-        scan_kassenbon(
-            TARGET_PATH,
-            excel_path=EXCEL_PATH,
-            review_when=REVIEW_WHEN,
-            strict_total=STRICT_TOTAL,
-            show_debug_footer=SHOW_FOOTER_DBG,
-        )
-    else:
-        print(f"❗ Pfad existiert nicht: {TARGET_PATH}")
+#    import os
+#    if os.path.isdir(TARGET_PATH):
+#        batch_scan_folder(
+#            TARGET_PATH,
+#            excel_path=EXCEL_PATH,
+#            review_when=REVIEW_WHEN,
+#            strict_total=STRICT_TOTAL,
+#            move_processed=MOVE_PROCESSED,
+#            verbose=VERBOSE,
+#        )
+#    elif os.path.isfile(TARGET_PATH):
+#        print(f"🖼️ Einzeldatei erkannt: {os.path.basename(TARGET_PATH)}")
+#        scan_kassenbon(
+#            TARGET_PATH,
+#            excel_path=EXCEL_PATH,
+#            review_when=REVIEW_WHEN,
+#            strict_total=STRICT_TOTAL,
+#            show_debug_footer=SHOW_FOOTER_DBG,
+#        )
+#    else:
+#        print(f"❗ Pfad existiert nicht: {TARGET_PATH}")
