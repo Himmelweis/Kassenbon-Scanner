@@ -34,7 +34,6 @@ from PIL import Image
 import re
 from pathlib import Path
 
-from paddle.device.cuda.cuda_graphed_layer import debug_print
 from paddleocr import PaddleOCR
 # ========= Debug Switches (standard: aus) =========
 
@@ -53,6 +52,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCAN_DIR = os.path.join(BASE_DIR, "Kassenbons")
 EXCEL_PATH = os.path.join(BASE_DIR, "kassenbons.xlsx")
+CSV_EXPORT_DIR = r"C:\KI\n8n\inbox\Receipts"
 
 USE_PADDLE = True
 _PADDLE_OCR = None
@@ -102,7 +102,7 @@ COLUMNS = [
 MASTER_COLUMNS = [
     "Datum","Uhrzeit","Laden",
     "Betrag (€)","Gegeben (€)","Wechselgeld (€)",
-    "Pfand (€)","MwSt %","MwSt (€)","Netto (€)","Zahlung",
+    "Pfand (€)","Pfandrückgabe (€)","MwSt %","MwSt (€)","Netto (€)","Zahlung",
     "Belegtyp",  # Typ immer vor Prüfstatus
     "Kategorie",
     "Prüfstatus" # << immer letzte Spalte
@@ -129,6 +129,21 @@ SHEET_BY_TYPE = {
     "generic": "Einzelhandel",
     "card_receipt": "Kartenzahlung",
 }
+
+INVALID_STORE_TOKENS = [
+    "QUITTUNGSNUMMER",
+    "RECHNUNGSNUMMER",
+    "BELEGNUMMER",
+    "BONNUMMER",
+    "KUNDENBELEG",
+    "KARTENZAHLUNG",
+    "GIROCARD",
+    "BETRAG",
+    "SUMME",
+    "TOTAL",
+    "DATUM",
+    "UHRZEIT",
+]
 
 def _columns_for_type(rtype: str) -> list[str]:
     """
@@ -203,6 +218,86 @@ def guess_category(name: str|None) -> str|None:
     for k, cat in MERCHANT_TO_KAT.items():
         if k in low: return cat
     return None
+def validate_receipt_result(best: dict, raw: str) -> list[str]:
+    import re
+
+    reasons = []
+
+    store = str(best.get("Laden") or "").strip()
+    total = best.get("Betrag (€)")
+    date = best.get("Datum")
+    time_value = best.get("Uhrzeit")
+    receipt_type = best.get("Belegtyp", "generic")
+
+    if not date:
+        reasons.append("Datum fehlt")
+
+    if not time_value:
+        reasons.append("Uhrzeit fehlt")
+
+    if not store:
+        reasons.append("Laden fehlt")
+    elif len(store) < 3:
+        reasons.append("Laden unplausibel")
+    elif re.fullmatch(r"[\d\s.,€\-]+", store):
+        reasons.append("Laden unplausibel")
+
+    try:
+        total_value = float(str(total).replace(",", "."))
+        if total_value <= 0 or total_value > 10000:
+            reasons.append("Betrag unplausibel")
+    except Exception:
+        reasons.append("Betrag fehlt/ungültig")
+
+    raw_up = (raw or "").upper()
+
+    # Supermarkt: Gesamtbetrag muss durch ein starkes Summensignal belegt sein
+    if receipt_type == "grocery":
+        strong_total = re.search(
+            r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*"
+            r"(ZU\s+ZAHLEN|SUMME|GESAMT|KARTENZAHLUNG)",
+            raw
+        )
+
+        if not strong_total:
+            reasons.append("Gesamtsumme nicht sicher erkannt")
+
+    return reasons
+
+def export_csv_for_n8n(excel_path=EXCEL_PATH, export_dir=CSV_EXPORT_DIR):
+    import os
+    import pandas as pd
+
+    os.makedirs(export_dir, exist_ok=True)
+
+    if not os.path.exists(excel_path):
+        print(f"⚠️ Excel-Datei nicht gefunden, CSV-Export übersprungen: {excel_path}")
+        return
+
+    xls = pd.ExcelFile(excel_path)
+
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(excel_path, sheet_name=sheet)
+
+        safe_sheet = (
+            sheet.lower()
+            .replace(" ", "_")
+            .replace("ä", "ae")
+            .replace("ö", "oe")
+            .replace("ü", "ue")
+            .replace("ß", "ss")
+        )
+
+        csv_path = os.path.join(export_dir, f"receipts_{safe_sheet}.csv")
+
+        df.to_csv(
+            csv_path,
+            index=False,
+            sep=";",
+            encoding="utf-8-sig"
+        )
+
+        print(f"📤 CSV exportiert: {csv_path}")
 
 # =================== Hilfsfunktionen ===================
 
@@ -231,6 +326,23 @@ def coerce_type_by_store(store: str, fallback: str = "grocery") -> str:
     # if re.search(r"\b(LIDL|ALDI|EDEKA|REWE|KAUFLAND|NORMA|PENNY|NETTO)\b", s): return "grocery"
     return None  # keine Meinung -> nichts erzwingen
 
+def sanitize_final_store(best):
+    store = str(best.get("Laden") or "").strip()
+    up = store.upper()
+
+    if not store:
+        return best
+
+    if any(tok in up for tok in INVALID_STORE_TOKENS):
+        best["Laden"] = ""
+        return best
+
+    # Zu zahlen / Betrag / reine Nummern sind nie Händler
+    if re.fullmatch(r"[\d\s.,€EUR-]+", up):
+        best["Laden"] = ""
+        return best
+
+    return best
 
 def _reset_payment_log_once():
     # Attribut beim Funktionsobjekt zurücksetzen
@@ -274,6 +386,29 @@ def diagnose_folder(folder):
     for f in files:
         diagnose_image(f)
 
+def print_receipt_diagnosis(filename: str, best: dict, raw: str):
+    print("\n" + "=" * 70)
+    print(f"DIAGNOSE: {filename}")
+
+    for key in [
+        "Datum",
+        "Uhrzeit",
+        "Laden",
+        "Betrag (€)",
+        "Zahlung",
+        "Belegtyp",
+        "Kategorie",
+        "Prüfstatus",
+    ]:
+        print(f"{key}: {best.get(key)}")
+
+    print("\n--- HEAD ---")
+    print("\n".join((raw or "").splitlines()[:30]))
+
+    print("\n--- TAIL ---")
+    print("\n".join((raw or "").splitlines()[-50:]))
+
+    print("=" * 70)
 
 def _norm_money(s: str) -> float | None:
     if not s: return None
@@ -543,6 +678,63 @@ def infer_cash_from_amounts(best: dict, text: str) -> str | None:
     change = best.get("Wechselgeld (€)")
     if isinstance(given, (int, float)) and (isinstance(change, (int, float)) or "wechselgeld" in low or "zurück" in low):
         return "Bar"
+    return None
+
+def infer_pharmacy_store(raw: str) -> str | None:
+    """
+    Rekonstruiert Apothekennamen aus dem Kopfbereich, ohne konkrete
+    Apotheken oder Inhaber zu kennen.
+
+    Beispiele:
+        APOTHEKE / ROSEN       -> Rosen Apotheke
+        APOTHEKE AM MARKT      -> Apotheke am Markt
+        SONNEN / APOTHEKE      -> Sonnen Apotheke
+    """
+    import re
+
+    lines = [
+        re.sub(r"\s+", " ", ln).strip()
+        for ln in (raw or "").splitlines()[:12]
+        if ln.strip()
+    ]
+
+    for i, line in enumerate(lines):
+        up = line.upper()
+
+        if "APOTHEKE" not in up:
+            continue
+
+        # Name steht bereits vollständig in derselben Zeile
+        if len(line.split()) >= 2:
+            cleaned = re.sub(r"\s+", " ", line).strip()
+            return cleaned.title()
+
+        # OCR zerlegt "ROSEN APOTHEKE" häufig in zwei Zeilen.
+        # Kurze alphabetische Nachbarzeile verwenden, aber keine Adresse,
+        # Nummer, Personenzeile oder technische Bezeichnung.
+        neighbours = []
+
+        if i > 0:
+            neighbours.append(lines[i - 1])
+        if i + 1 < len(lines):
+            neighbours.append(lines[i + 1])
+
+        for candidate in neighbours:
+            candidate_up = candidate.upper()
+
+            if not re.fullmatch(r"[A-ZÄÖÜa-zäöüß\- ]{3,30}", candidate):
+                continue
+
+            if any(token in candidate_up for token in [
+                "STRASSE", "STR.", "PLATZ", "WEG", "TEL",
+                "FAX", "KUNDEN", "DATUM", "UHRZEIT",
+            ]):
+                continue
+
+            return f"{candidate.title()} Apotheke"
+
+        return "Apotheke"
+
     return None
 
 def _float_de(s: str):
@@ -878,6 +1070,43 @@ def _strip_line_leaders(s: str) -> str:
     # entfernt führende » | > • : und überflüssige Spaces je Zeile
     return "\n".join(re.sub(r"^[\s\|\>\u00BB\u2022»«·•:]+", "", ln) for ln in s.splitlines())
 
+def reconcile_cash_amounts(best: dict, raw: str) -> dict:
+    import re
+
+    text = raw or ""
+
+    given = best.get("Gegeben (€)")
+    change = best.get("Wechselgeld (€)")
+
+    # Betrag unmittelbar vor "Gegeben Bar"
+    m = re.search(
+        r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*"
+        r"(?:\n\s*)?Gegeben\s+Bar",
+        text
+    )
+    if m:
+        given = float(m.group(1).replace(",", "."))
+        best["Gegeben (€)"] = given
+
+    # Betrag unmittelbar vor "Zurück/Rückgeld"
+    m = re.search(
+        r"(?is)([-]?\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*"
+        r"(?:\n\s*)?(?:Zurück|Rückgeld)",
+        text
+    )
+    if m:
+        change = abs(float(m.group(1).replace(",", ".")))
+        best["Wechselgeld (€)"] = change
+
+    # Stärkste Plausibilitätsregel für Barzahlungen
+    if isinstance(given, (int, float)) and isinstance(change, (int, float)):
+        calculated_total = round(given - change, 2)
+
+        if calculated_total > 0:
+            best["Betrag (€)"] = calculated_total
+            best["Zahlung"] = "Bar"
+
+    return best
 
 def post_ocr_cleanup(text: str) -> str:
     if text is None: return ""
@@ -1386,6 +1615,44 @@ def ocr_bruteforce_totals(image_path: str) -> list[str]:
             seen.add(t); uniq.append(t)
     return uniq
 
+def extract_pfand_info(raw: str):
+    import re
+
+    pfand = 0.0
+    pfandrueckgabe = 0.0
+
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+
+    seen = set()
+
+    for i, ln in enumerate(lines):
+
+        up = ln.upper()
+
+        # Pfandrückgabe
+        if "PFANDRÜCKGABE" in up or "LEERGUT" in up:
+            # Betrag meist in Zeile davor
+            if i > 0:
+                m = re.search(r"([-]?\d{1,4}[.,]\d{2})", lines[i-1])
+                if m:
+                    pfandrueckgabe += abs(float(m.group(1).replace(",", ".")))
+            continue
+
+        # Pfandkauf
+        m = re.match(r"(?i)^PFAND\s+(\d{1,2}[.,]\d{2})", ln)
+
+        if m:
+            key = ln.upper()
+
+            # doppelte OCR-Treffer verhindern
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            pfand += float(m.group(1).replace(",", "."))
+
+    return round(pfand, 2), round(pfandrueckgabe, 2)
 
 def _dedupe_strs(items: list[str]) -> list[str]:
     """Dedupe bei Strings; ignoriert Nicht-Strings vorher (via _flatten_texts)."""
@@ -4636,6 +4903,19 @@ def _status_from(best: dict) -> str:
     if best.get("Wechselgeld (€)") == 0:
         best["Wechselgeld (€)"] = ""
 
+    if best.get("Belegtyp") == "grocery":
+        if "zu zahlen" not in raw.lower() and "summe" not in raw.lower():
+            best["Prüfstatus"] = "🔎 Prüfen: Summe nicht sicher erkannt"
+
+    if best.get("Belegtyp") == "pharmacy" or "APOTHEKE" in txt_up:
+        pharmacy_store = infer_pharmacy_store(raw)
+
+        if pharmacy_store:
+            best["Laden"] = pharmacy_store
+
+        best["Belegtyp"] = "pharmacy"
+        rtype = "pharmacy"
+
     # Ergebnis
     if not reasons:
         return "OK"
@@ -4670,6 +4950,7 @@ def finalize_and_save_receipt(best: dict, rtype: str, excel_path: str):
     try:
         append_to_excel_typed(reviewed, reviewed.get("Belegtyp", rtype), excel_path=excel_path)
         print(f"✅ Gespeichert nach: {excel_path}")
+        export_csv_for_n8n(excel_path)
     except Exception as e:
         print(f"⚠️ Excel-Schreiben fehlgeschlagen: {e}")
 
@@ -4710,6 +4991,47 @@ def normalize_tax_fields(best: dict) -> dict:
 
     return best
 
+def extract_pfand_info(raw):
+    import re
+
+    pfand = 0.0
+    rueckgabe = 0.0
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    # doppelte OCR-Zeilen verhindern
+    seen_pfand = set()
+
+    for i, ln in enumerate(lines):
+
+        up = ln.upper()
+
+        # Pfandkauf
+        m = re.match(r"(?i)^PFAND\s+(\d+[.,]\d{2})", ln)
+
+        if m:
+            key = m.group(1)
+
+            if key not in seen_pfand:
+                seen_pfand.add(key)
+                pfand += float(key.replace(",", "."))
+
+        # Pfandrückgabe
+        if "PFANDRÜCKGABE" in up:
+
+            # Betrag meist davor
+            for j in range(i - 3, i):
+                if j < 0:
+                    continue
+
+                mm = re.search(r"([-]?\d+[.,]\d{2})", lines[j])
+
+                if mm:
+                    rueckgabe = abs(float(mm.group(1).replace(",", ".")))
+                    break
+
+    return round(pfand, 2), round(rueckgabe, 2)
+
 def infer_category(best: dict) -> str:
     import re
 
@@ -4749,6 +5071,43 @@ def infer_category(best: dict) -> str:
         return "Einzelhandel"
 
     return "Sonstiges"
+
+def normalize_store_by_text(best: dict, raw: str) -> dict:
+    import re
+
+    txt = (raw or "").upper()
+
+    # LIDL: auch ohne Logo
+    if (
+            "LIDL PLUS" in txt
+            or "LIDL PAY" in txt
+            or "LDL-" in txt
+            or "UST ID-NR: DE813389176" in txt
+            or "UST-ID-NR: DE813389176" in txt
+    ):
+        best["Laden"] = "LIDL"
+        best["Belegtyp"] = "grocery"
+        best["Kategorie"] = "Lebensmittel"
+        return best
+
+    # REWE: OCR oft als RE / RWE / Adresse + typische Begriffe
+    if (
+            re.search(r"\bREWE\b", txt)
+            or "REWE MARKT" in txt
+    ):
+        best["Laden"] = "REWE"
+        best["Belegtyp"] = "grocery"
+        best["Kategorie"] = "Lebensmittel"
+        return best
+
+    # Kaufland
+    if "KAUFLAND" in txt:
+        best["Laden"] = "KAUFLAND"
+        best["Belegtyp"] = "grocery"
+        best["Kategorie"] = "Lebensmittel"
+        return best
+
+    return best
 
 # =========================
 # ENRICHER / NACHSCHÄRFUNG
@@ -5073,7 +5432,57 @@ def extract_best_datetime(text: str) -> tuple[str | None, str | None]:
             except Exception:
                 pass
 
+    # Fallback für beschriftete Kaufland-/Kassenfooter:
+    # "Datum:07.07.26 Zeit: 08:45:45"
     if not candidates:
+        m = re.search(
+            r"(?is)\bDatum[:\s]*(\d{1,2})[.,](\d{1,2})[.,](\d{2,4})"
+            r"\s+Zeit[:\s]*(\d{1,2}):(\d{2})(?::\d{2})?",
+            text
+        )
+
+        if m:
+            dd, mm, yy, hh, minute = m.groups()
+
+            if len(yy) == 2:
+                yy = "20" + yy
+
+            try:
+                if (
+                    1 <= int(dd) <= 31
+                    and 1 <= int(mm) <= 12
+                    and 0 <= int(hh) <= 23
+                    and 0 <= int(minute) <= 59
+                ):
+                    candidates.append(
+                        (
+                            3,
+                            m.start(),
+                            f"{yy}-{int(mm):02d}-{int(dd):02d}",
+                            f"{int(hh):02d}:{minute}",
+                        )
+                    )
+            except Exception:
+                pass
+
+    if not candidates:
+        # Fallback: Uhrzeit und Datum stehen getrennt untereinander, z. B.
+        # 11:25
+        # 11.06.26
+        m = re.search(
+            r"(?is)\b(\d{2}:\d{2})\b\s*\n\s*(\d{1,2}[.,]\d{2}[.,]\d{2,4})\b",
+            text
+        )
+        if m:
+            found_time = m.group(1)
+            found_date = m.group(2).replace(",", ".")
+
+            md = re.match(r"(\d{1,2})\.(\d{2})\.(\d{2,4})", found_date)
+            if md:
+                dd, mm, yy = md.groups()
+                if len(yy) == 2:
+                    yy = "20" + yy
+                return f"{yy}-{mm}-{int(dd):02d}", found_time
         return None, None
 
     # höchster Score gewinnt; bei Gleichstand späterer Bonbereich
@@ -5443,6 +5852,7 @@ def scan_kassenbon(
     # =========================
     # Gemeinsame Nachbearbeitung
     # =========================
+
     combo_raw = "\n".join(texts)
     combo_text = safe_post_ocr_cleanup(combo_raw)
 
@@ -5465,7 +5875,9 @@ def scan_kassenbon(
                 best["Datum"] = None
                 best["Uhrzeit"] = None
 
-    raw = best.get("Rohtext", "") or "\n".join(texts)
+    raw = combo_text or best.get("Rohtext", "") or "\n".join(texts)
+    best["Rohtext"] = raw
+    txt_up = raw.upper()
     # 3) Datum/Uhrzeit robust neu ziehen
     if not best.get("Datum") or not best.get("Uhrzeit"):
         dt_date, dt_time = extract_best_datetime(raw)
@@ -5529,9 +5941,139 @@ def scan_kassenbon(
         pass
 
     best = fill_missing_date_from_existing_time(best, texts)
-    if not best.get("Betrag (€)") or not best.get("Datum") or not best.get("Laden"):
+
+    raw = combo_text or best.get("Rohtext", "") or "\n".join(texts)
+    best["Rohtext"] = raw
+    txt_up = raw.upper()
+
+    # Supermarkt-Betrag nur aus starken Summenfeldern übernehmen
+    if best.get("Belegtyp") == "grocery":
+        m = re.search(
+            r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*(zu zahlen|summe)",
+            raw
+        )
+        if m:
+            best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+        else:
+            best["Prüfstatus"] = "🔎 Prüfen: Summe nicht sicher erkannt"
+
+    # Zentrale Händlerprofile
+    best = normalize_store_by_text(best, raw)
+    best = sanitize_final_store(best)
+    if not best.get("Betrag (€)") or not best.get("Laden"):
+        return None
+
+    if best.get("Laden") == "LIDL":
+        m = re.search(r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*zu zahlen", raw)
+        if m:
+            best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+    rtype = best.get("Belegtyp", rtype)
+
+    # Lidl erkennen, auch wenn Logo oben nicht erkannt wurde
+    if "LIDL PLUS" in txt_up or re.search(r"\bLIDL\b", txt_up) or re.search(r"\bLIDL\s*PAY\b", txt_up):
+        best["Laden"] = "LIDL"
+        best["Belegtyp"] = "grocery"
+        rtype = "grocery"
+
+    # Betrag aus "zu zahlen"
+    if "LIDL PLUS" in txt_up or re.search(r"\bLIDL\b", txt_up):
+        m = re.search(r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*zu zahlen", raw)
+        if m:
+            best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+
+    # Bar / Gegeben / Rückgeld
+    if not best.get("Zahlung") and re.search(r"(?is)\bBAR\b", raw):
+        best["Zahlung"] = "Bar"
+
+    if not best.get("Gegeben (€)"):
+        m = re.search(
+            r"(?is)zu zahlen\s*\n?\s*(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*Bar",
+            raw
+        )
+        if m:
+            best["Gegeben (€)"] = float(m.group(1).replace(",", "."))
+
+    # Wechselgeld bei Lidl robust setzen
+    if "LIDL" in txt_up:
+        m = re.search(
+            r"(?is)([-]?\d{1,4}[.,]\d{2})\s*\n\s*Rückgeld",
+            raw
+        )
+        if m:
+            best["Wechselgeld (€)"] = abs(float(m.group(1).replace(",", ".")))
+    elif not best.get("Wechselgeld (€)"):
+        m = re.search(r"(?is)([-]?\d{1,4}[.,]\d{2})\s*Rückgeld", raw)
+        if m:
+            best["Wechselgeld (€)"] = abs(float(m.group(1).replace(",", ".")))
+
+    if "LIDL" in txt_up:
+        best["Pfand (€)"] = ""
+        best["Pfandrückgabe (€)"] = ""
+
+        pfand_lines = set()
+        pfand_sum = 0.0
+
+        for ln in [x.strip() for x in raw.splitlines() if x.strip()]:
+            m = re.match(r"(?i)^Pfand\s+(\d{1,2}[.,]\d{2})\b", ln)
+            if m:
+                key = ln.upper()
+                if key not in pfand_lines:
+                    pfand_lines.add(key)
+                    pfand_sum += float(m.group(1).replace(",", "."))
+
+        if pfand_sum:
+            best["Pfand (€)"] = round(pfand_sum, 2)
+
+        # Pfandrückgabe: Betrag vor "Pfandrückgabe"
+        m = re.search(
+            r"(?is)([-]?\d{1,4}[.,]\d{2})\s*[A-Z]?\s*\n\s*Pfandrückgabe",
+            raw
+        )
+        if m:
+            best["Pfandrückgabe (€)"] = abs(float(m.group(1).replace(",", ".")))
+
+    print("DEBUG FINAL IMAGE:")
+    for k in ["Datum", "Uhrzeit", "Laden", "Betrag (€)", "Gegeben (€)", "Wechselgeld (€)", "Zahlung", "Belegtyp"]:
+        print(f"  {k}: {best.get(k)}")
+
+    print("DEBUG LIDL CHECK:", "LIDL" in txt_up, "LIDL PLUS" in txt_up)
+    print("DEBUG ZU ZAHLEN:", bool(re.search(r"(?is)zu zahlen", raw)))
+    print("DEBUG BETRAG MATCH:", re.findall(r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*zu zahlen", raw))
+    print("--- RAW TAIL 80 ---")
+    print("\n".join(raw.splitlines()[-80:]))
+
+    if not best.get("Betrag (€)") or not best.get("Laden"):
         print("❗ Ergebnis unvollständig – wird nicht gespeichert.")
         return None
+
+    pfand, rueckgabe = extract_pfand_info(raw)
+
+    if pfand:
+        best["Pfand (€)"] = pfand
+
+    if rueckgabe:
+        best["Pfandrückgabe (€)"] = rueckgabe
+
+    pfand, rueckgabe = extract_pfand_info(raw)
+
+    print("DEBUG PFAND EXTRACT:", pfand, rueckgabe)
+
+    best["Pfand (€)"] = pfand if pfand else ""
+    best["Pfandrückgabe (€)"] = rueckgabe if rueckgabe else ""
+
+    pfand, rueckgabe = extract_pfand_info(raw)
+
+    print("DEBUG PFAND EXTRACT:", pfand, rueckgabe)
+
+    best["Pfand (€)"] = pfand if pfand else ""
+    best["Pfandrückgabe (€)"] = rueckgabe if rueckgabe else ""
+
+    print_receipt_diagnosis(
+        os.path.basename(image_path),
+        best,
+        raw
+    )
+
     return finalize_and_save_receipt(best, rtype, excel_path)
 
 def scan_kassenbon_group(
@@ -6214,11 +6756,12 @@ def scan_pdf_receipt(
         combined_text = pdf_text
 
         # Testausgabe
-        #print("\n--- PDF OCR CLEAN HEAD ---")
-        #print("\n".join(combined_text.splitlines()[:40]))
+        print("\n--- PDF OCR CLEAN HEAD ---")
+        print("\n".join(combined_text.splitlines()[:80]))
 
-        #print("\n--- PDF OCR CLEAN TAIL ---")
-        #print("\n".join(combined_text.splitlines()[-40:]))
+        print("\n--- PDF OCR CLEAN TAIL ---")
+        print("\n".join(combined_text.splitlines()[-100:]))
+
 
         # 3) Debug-Ausgaben (analog zu scan_kassenbon)
         if show_debug_footer or debug_print:
@@ -6291,9 +6834,124 @@ def scan_pdf_receipt(
         except Exception:
             pass
 
+        # Lidl / Grocery stabilisieren
+        try:
+            raw = best.get("Rohtext", "") or combined_text or ""
+            txt_up = raw.upper()
+
+            if (
+                "LIDL PLUS" in txt_up
+                or re.search(r"\bLIDL\b", txt_up)
+                or re.search(r"\bLIDL\s*PAY\b", txt_up)
+                or "LDL-" in txt_up
+                or re.search(r"(?m)^\s*LDL\s*$", txt_up)
+            ):
+                best["Laden"] = "LIDL"
+                best["Belegtyp"] = "grocery"
+                rtype = "grocery"
+
+                m = re.search(
+                    r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*zu zahlen",
+                    raw
+                )
+                if m:
+                    best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+
+                if not best.get("Zahlung") and re.search(r"(?is)\bBAR\b", raw):
+                    best["Zahlung"] = "Bar"
+
+                m = re.search(
+                    r"(?is)zu zahlen\s*\n?\s*(\d{1,4}[.,]\d{2})"
+                    r"\s*(?:EUR)?\s*\n?\s*Bar",
+                    raw
+                )
+                if m:
+                    best["Gegeben (€)"] = float(m.group(1).replace(",", "."))
+
+                m = re.search(
+                    r"(?is)([-]?\d{1,4}[.,]\d{2})\s*\n\s*Rückgeld",
+                    raw
+                )
+                if m:
+                    best["Wechselgeld (€)"] = abs(
+                        float(m.group(1).replace(",", "."))
+                    )
+
+        except Exception as e:
+            print(f"⚠️ Lidl-Stabilisierung fehlgeschlagen: {e}")
+
+        # Kaufland stabilisieren
+        try:
+            raw = best.get("Rohtext", "") or combined_text or ""
+            txt_up = raw.upper()
+
+            if "KAUFLAND" in txt_up or "KAUF LAND" in txt_up:
+                best["Laden"] = "KAUFLAND"
+                best["Belegtyp"] = "grocery"
+                rtype = "grocery"
+
+                m = re.search(
+                    r"(?is)Datum[:\s]*(\d{1,2})[.,](\d{1,2})[.,](\d{2,4})"
+                    r"\s+Zeit[:\s]*(\d{1,2}):(\d{2})",
+                    raw
+                )
+                if m:
+                    dd, mm, yy, hh, mi = m.groups()
+
+                    if len(yy) == 2:
+                        yy = "20" + yy
+
+                    best["Datum"] = f"{yy}-{int(mm):02d}-{int(dd):02d}"
+                    best["Uhrzeit"] = f"{int(hh):02d}:{mi}"
+
+                m = re.search(
+                    r"(?is)(\d{1,4}[.,]\d{2})\s*\n\s*Su[mn]e",
+                    raw
+                )
+                if m:
+                    best["Betrag (€)"] = float(
+                        m.group(1).replace(",", ".")
+                    )
+
+                if (
+                    not best.get("Zahlung")
+                    and re.search(r"(?is)KARTENZAHLUNG|GIROCARD", raw)
+                ):
+                    best["Zahlung"] = "Karte"
+
+        except Exception as e:
+            print(f"⚠️ Kaufland-Stabilisierung fehlgeschlagen: {e}")
+
+        # Pfand allgemein auswerten
+        try:
+            pfand, rueckgabe = extract_pfand_info(raw)
+
+            # Vorhandene falsche Werte bewusst überschreiben
+            best["Pfand (€)"] = pfand if pfand else ""
+            best["Pfandrückgabe (€)"] = rueckgabe if rueckgabe else ""
+
+            print(
+                "DEBUG PFAND EXTRACT:",
+                best.get("Pfand (€)"),
+                best.get("Pfandrückgabe (€)")
+            )
+
+        except Exception as e:
+            print(f"⚠️ Pfand-Auswertung fehlgeschlagen: {e}")
+
+        best = normalize_store_by_text(best, raw)
+        best = sanitize_final_store(best)
+        if not best.get("Betrag (€)") or not best.get("Laden"):
+            return None
+
+        if best.get("Laden") == "LIDL":
+            m = re.search(r"(?is)(\d{1,4}[.,]\d{2})\s*(?:EUR)?\s*\n?\s*zu zahlen", raw)
+            if m:
+                best["Betrag (€)"] = float(m.group(1).replace(",", "."))
+        rtype = best.get("Belegtyp", rtype)
         best["Kategorie"] = infer_category(best)
 
-        if not best.get("Betrag (€)") or not best.get("Datum") or not best.get("Laden"):
+        if not best.get("Betrag (€)") or not best.get("Laden"):
             print("❗ Ergebnis unvollständig – wird nicht gespeichert.")
             return None
 
@@ -6393,6 +7051,13 @@ def batch_scan_folder(folder: str,
                 rc += 1
             else:
                 ec += 1
+
+            reasons = validate_receipt_result(best, raw)
+
+            if reasons:
+                best["Prüfstatus"] = "🔎 Prüfen: " + ", ".join(reasons)
+            else:
+                best["Prüfstatus"] = "✅ OK"
     
             # Optional: Dateien verschieben (alle Teile eines Bons gemeinsam)
             if move_processed:
@@ -6430,7 +7095,7 @@ def batch_scan_folder(folder: str,
 
 if __name__ == "__main__":
     diagnose_pdf_receipt(
-        r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\_error\Hagebau doppelseite_20260606_0001.pdf"
+        r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\_error\IMG_20260707_0001.pdf"
     )
 #    TARGET_PATH     = r"C:\Users\ONeum\Documents\Projekte\Kassenbon-Scanner\Kassenbons"  # Datei ODER Ordner
 #    EXCEL_PATH      = "kassenbons.xlsx"
