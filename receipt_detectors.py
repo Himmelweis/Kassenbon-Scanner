@@ -121,11 +121,12 @@ class DetectorPipeline:
 
     def __init__(self, detectors: Iterable[BaseDetector[Any]] | None = None) -> None:
         self._detectors: list[BaseDetector[Any]] = []
-        for detector in detectors or (
-            StoreDetector(),
-            AmountDetector(),
-            PaymentDetector(),
-        ):
+        selected = (
+            (StoreDetector(), AmountDetector(), PaymentDetector())
+            if detectors is None
+            else detectors
+        )
+        for detector in selected:
             self.register(detector)
 
     @property
