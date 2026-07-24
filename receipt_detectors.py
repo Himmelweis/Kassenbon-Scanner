@@ -9,12 +9,7 @@ from datetime import date
 from typing import Any
 
 from detector_base import BaseDetector, DetectionResult, ReceiptDocument
-from receipt_pipeline import (
-    extract_payment_values,
-    extract_store_candidate,
-    extract_total_candidate,
-)
-
+from receipt_pipeline import extract_payment_values, extract_store_candidate, extract_total_candidate
 
 _MONEY_TOKEN = r"(\d{1,4}[.,]\d{2})"
 _DATE_TOKEN = re.compile(r"\b(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})\b")
@@ -59,6 +54,33 @@ def _labeled_money(text: str, labels: str) -> float | None:
     return None
 
 
+def _explicit_total(document: ReceiptDocument) -> tuple[float | None, str | None, int, str | None, int | None]:
+    """Findet einen Gesamtbetrag nur innerhalb einer einzelnen, expliziten Gesamtzeile."""
+    candidates: list[tuple[int, int, float, str, str, int]] = []
+    strong = r"BAR[- ]?TOTAL|RECHNUNGSBETRAG|GESAMTBETRAG|ENDBETRAG"
+    normal = r"TOTAL|SUMME|GESAMT|ZU[ \t]+ZAHLEN"
+
+    for line_number, line in enumerate(document.text.splitlines(), start=1):
+        if re.search(r"(?i)\b(MWST|MWST\.|UST|VAT|STEUER|NETTO)\b", line):
+            continue
+        patterns = (
+            (rf"\b(?:{strong})\b[^\d-]{{0,45}}{_MONEY_TOKEN}", 110, "label-before-strong"),
+            (rf"\b(?:{normal})\b[^\d-]{{0,45}}{_MONEY_TOKEN}", 100, "label-before"),
+            (rf"{_MONEY_TOKEN}[ \t]*(?:EUR|EURO|€)?[ \t]*(?:{strong})\b", 110, "label-after-strong"),
+            (rf"{_MONEY_TOKEN}[ \t]*(?:EUR|EURO|€)?[ \t]*(?:{normal})\b", 105, "label-after"),
+        )
+        for pattern, score, source in patterns:
+            match = re.search(pattern, line, re.I)
+            if match:
+                candidates.append((score, -line_number, _money(match.group(1)), source, line.strip(), line_number))
+
+    if not candidates:
+        return None, None, 0, None, None
+    candidates.sort(reverse=True)
+    score, _, value, source, source_text, line_number = candidates[0]
+    return round(value, 2), source, score, source_text, line_number
+
+
 class StoreDetector(BaseDetector[str]):
     field = "store"
 
@@ -86,7 +108,10 @@ class AmountDetector(BaseDetector[float]):
     field = "total"
 
     def detect(self, document: ReceiptDocument) -> DetectionResult[float]:
-        value, source, score = extract_total_candidate(document.text, document.receipt_type)
+        value, source, score, source_text, line_number = _explicit_total(document)
+        if value is None:
+            value, source, score = extract_total_candidate(document.text, document.receipt_type)
+
         warnings: tuple[str, ...] = ()
         if value is None:
             warnings = ("Kein Gesamtbetrag gefunden",)
@@ -97,6 +122,8 @@ class AmountDetector(BaseDetector[float]):
             value=value,
             confidence=_confidence_from_score(score),
             detector=self.name,
+            source_text=source_text,
+            line_number=line_number,
             reasoning=(source,) if source else (),
             warnings=warnings,
             metadata={"raw_score": score, "source_rule": source},
