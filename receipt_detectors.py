@@ -8,6 +8,7 @@ bestehende Aufrufer zu brechen.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -17,6 +18,9 @@ from receipt_pipeline import (
     extract_store_candidate,
     extract_total_candidate,
 )
+
+
+_MONEY_TOKEN = r"(\d{1,4}[.,]\d{2})"
 
 
 def _line_number(document: ReceiptDocument, source_text: str | None) -> int | None:
@@ -31,6 +35,27 @@ def _line_number(document: ReceiptDocument, source_text: str | None) -> int | No
 
 def _confidence_from_score(score: int, maximum: int = 110) -> float:
     return max(0.0, min(1.0, score / maximum))
+
+
+def _money(value: str) -> float:
+    return float(value.replace(".", "").replace(",", "."))
+
+
+def _labeled_money(text: str, labels: str) -> float | None:
+    """Liest einen Geldbetrag nur aus derselben Zeile wie sein Bezeichner.
+
+    Das verhindert, dass ein vorheriger Betrag ueber einen Zeilenumbruch hinweg
+    faelschlich einem spaeteren Bezeichner wie ``RUECKGELD`` zugeordnet wird.
+    """
+    patterns = (
+        rf"\b(?:{labels})\b[^\d\r\n-]{{0,25}}-?{_MONEY_TOKEN}",
+        rf"{_MONEY_TOKEN}[ \t]*(?:EUR|EURO|€)?[ \t]*(?:{labels})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return abs(_money(match.group(1)))
+    return None
 
 
 class StoreDetector(BaseDetector[str]):
@@ -90,6 +115,19 @@ class PaymentDetector(BaseDetector[str]):
 
     def detect(self, document: ReceiptDocument) -> DetectionResult[str]:
         values = extract_payment_values(document.text)
+
+        given = _labeled_money(document.text, r"GEGEBEN(?:ER[ \t]+BETRAG)?")
+        change = _labeled_money(
+            document.text,
+            r"ZURÜCK|ZURUECK|RÜCKGELD|RUECKGELD",
+        )
+        if given is not None:
+            values["Gegeben (€)"] = given
+        if change is not None:
+            values["Wechselgeld (€)"] = change
+        if given is not None and change is not None and given >= change:
+            values["Betrag aus Bararithmetik (€)"] = round(given - change, 2)
+
         value = values.get("Zahlung")
 
         reasoning: list[str] = []
